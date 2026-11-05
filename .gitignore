@@ -1,0 +1,13 @@
+# Compiled binaries
+socket_resolver
+socket_resolver_asan
+afxdp_resolver
+afxdp_resolver_asan
+xsk_rx_test
+
+# BPF objects
+*.o
+
+# Editor / OS cruft
+*.swp
+.DS_Store
