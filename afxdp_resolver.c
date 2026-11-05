@@ -30,25 +30,14 @@
  *     valid if a router sits between client and server.
  *   - Copy mode (XDP_COPY).  Zero-copy would need an i40e/ice/ixgbe/
  *     mlx5 NIC, not the e1000e this is tested on.
- *   - XDP attach mode (--skb / --drv) must be passed explicitly: the
- *     driver decides what "default" (flags=0) means, and on veth that
- *     is native (XDP_FLAGS_DRV_MODE-equivalent), NOT generic, so the
- *     comment "generic XDP" in earlier versions of this file was wrong
- *     for veth.  See configs A/B/C in the benchmark plan.
  *
  * Build:
- *   clang -O2 -g -target bpf \
- *       -I/usr/include/$(uname -m)-linux-gnu \
- *       -c xdp_kern.c -o xdp_kern.o
+ *   clang -O2 -g -target bpf -c xdp_kern.c -o xdp_kern.o
  *   gcc -O3 -Wall -Wextra -o afxdp_resolver afxdp_resolver.c dns.c \
  *       -lxdp -lbpf
- *   (ASan build: add -fno-sanitize=alignment — UBSan otherwise flags
- *    the IP header at byte offset 14 as misaligned, which is normal
- *    for raw packet buffers and harmless on x86.)
  *
  * Usage:
- *   sudo ./afxdp_resolver --local --skb <interface>   # generic/SKB mode
- *   sudo ./afxdp_resolver --local --drv <interface>   # native/driver mode
+ *   sudo ./afxdp_resolver --local <interface>
  */
 
 #define _GNU_SOURCE
@@ -65,9 +54,9 @@
 #include <stdint.h>
 
 #include <linux/if_ether.h>
-#include <linux/if_link.h>     /* XDP_FLAGS_SKB_MODE / XDP_FLAGS_DRV_MODE */
 #include <linux/ip.h>
 #include <linux/udp.h>
+#include <linux/if_link.h>     /* XDP_FLAGS_SKB_MODE / XDP_FLAGS_DRV_MODE */
 
 #include <xdp/xsk.h>
 #include <bpf/libbpf.h>
@@ -236,26 +225,23 @@ static int process_dns(const uint8_t *query, int query_len,
 int main(int argc, char *argv[]) {
     const char *ifname = NULL;
     int local_mode = 0;
-    int xdp_mode_flag = 0;      /* XDP_FLAGS_SKB_MODE or XDP_FLAGS_DRV_MODE */
+    __u32 xdp_mode = 0;    /* 0 = kernel picks (native if supported) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--local") == 0)
             local_mode = 1;
         else if (strcmp(argv[i], "--skb") == 0)
-            xdp_mode_flag = XDP_FLAGS_SKB_MODE;
+            xdp_mode = XDP_FLAGS_SKB_MODE;     /* force generic XDP */
         else if (strcmp(argv[i], "--drv") == 0)
-            xdp_mode_flag = XDP_FLAGS_DRV_MODE;
+            xdp_mode = XDP_FLAGS_DRV_MODE;     /* force native XDP */
         else
             ifname = argv[i];
     }
 
-    if (!ifname || xdp_mode_flag == 0) {
+    if (!ifname) {
         fprintf(stderr,
-                "Usage: %s --local (--skb | --drv) <interface>\n"
-                "  --skb  generic (SKB) mode — works on any NIC/veth\n"
-                "  --drv  native (driver) mode — needs driver XDP support\n"
-                "  (v1 supports --local mode only; mode and interface "
-                "are required)\n",
+                "Usage: %s --local <interface> [--skb|--drv]\n"
+                "  (v1 supports --local mode only; interface is required)\n",
                 argv[0]);
         return 1;
     }
@@ -280,10 +266,7 @@ int main(int argc, char *argv[]) {
     }
 
     signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);   /* `kill`/`timeout` must also
-                                         * reach the cleanup path, or
-                                         * the XDP program stays attached
-                                         * and the next run fails to bind. */
+    signal(SIGTERM, sigint_handler);
 
     /* ============================================================
      * 1. Allocate UMEM
@@ -326,15 +309,11 @@ int main(int argc, char *argv[]) {
     struct xsk_ring_cons rx_ring = {0};     /* patch fix: zero-init */
     struct xsk_ring_prod tx_ring = {0};
 
-    /* xdp_flags here is cosmetic: XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
-     * means libxdp does NOT load/attach a program on our behalf, so the
-     * actual attach mode (SKB vs DRV) is set below via bpf_xdp_attach(),
-     * using xdp_mode_flag from the command line. */
     struct xsk_socket_config xsk_cfg = {
         .rx_size        = XSK_RING_CONS__DEFAULT_NUM_DESCS,
         .tx_size        = XSK_RING_PROD__DEFAULT_NUM_DESCS,
         .libbpf_flags   = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags      = 0,
+        .xdp_flags      = 0,    /* generic mode (SKB) — fine for e1000e */
         .bind_flags     = XDP_COPY | XDP_USE_NEED_WAKEUP,
     };
 
@@ -373,7 +352,7 @@ int main(int argc, char *argv[]) {
     }
 
     int prog_fd = bpf_program__fd(prog);
-    ret = bpf_xdp_attach(ifindex, prog_fd, xdp_mode_flag, NULL);
+    ret = bpf_xdp_attach(ifindex, prog_fd, xdp_mode, NULL);
     if (ret) {
         fprintf(stderr, "bpf_xdp_attach: %s\n", strerror(-ret));
         goto cleanup;
@@ -418,10 +397,11 @@ int main(int argc, char *argv[]) {
         frame_pool_free((uint64_t)i * FRAME_SIZE);
 
     fprintf(stderr,
-            "afxdp_resolver on %s (local mode, copy mode, %s XDP)\n"
+            "afxdp_resolver on %s (local mode, copy mode, XDP mode: %s)\n"
             "  UMEM: %u frames x %u bytes  (RX pre-fill: %u, TX pool: %d)\n",
             ifname,
-            xdp_mode_flag == XDP_FLAGS_DRV_MODE ? "native/drv" : "generic/skb",
+            xdp_mode == XDP_FLAGS_SKB_MODE ? "generic (forced)" :
+            xdp_mode == XDP_FLAGS_DRV_MODE ? "native (forced)"  : "auto",
             NUM_FRAMES, FRAME_SIZE,
             umem_cfg.fill_size, free_tx_count);
 
@@ -494,16 +474,15 @@ int main(int argc, char *argv[]) {
             if (ip_hdr_len < 20) continue;
             if (ip->protocol != IPPROTO_UDP) continue;
 
-            /* ip_hdr_len can exceed 20 when the IP header carries
-             * options; the earlier size check only covers the minimum
-             * (no-options) header, so re-check before touching udphdr. */
-            int udp_data_off = sizeof(struct ethhdr) + ip_hdr_len +
-                               (int)sizeof(struct udphdr);
-            if (udp_data_off > (int)rx_len) continue;
+            /* IP options can push the UDP header past the frame end */
+            if (sizeof(struct ethhdr) + ip_hdr_len + sizeof(struct udphdr) > rx_len)
+                continue;
 
             struct udphdr *udp = (struct udphdr *)((uint8_t *)ip + ip_hdr_len);
             if (ntohs(udp->dest) != RESOLVER_PORT) continue;
 
+            int udp_data_off = sizeof(struct ethhdr) + ip_hdr_len +
+                               sizeof(struct udphdr);
             int udp_data_len = (int)rx_len - udp_data_off;
             if (udp_data_len <= 0) continue;
 
@@ -582,7 +561,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "\nafxdp_resolver: RX=%lu TX=%lu\n", rx_pkts, tx_pkts);
 
 detach:
-    bpf_xdp_detach(ifindex, xdp_mode_flag, NULL);
+    bpf_xdp_detach(ifindex, xdp_mode, NULL);
 cleanup:
     xsk_socket__delete(xsk);
     xsk_umem__delete(umem);
