@@ -1,13 +1,26 @@
-# Compiled binaries
-socket_resolver
-socket_resolver_asan
-afxdp_resolver
-afxdp_resolver_asan
-xsk_rx_test
-
-# BPF objects
+# --- Build output (make, in src/) ---------------------------------------
+src/socket_resolver
+src/socket_resolver_asan
+src/afxdp_resolver
+src/afxdp_resolver_asan
+src/xsk_rx_test
 *.o
 
-# Editor / OS cruft
+# --- Generated while testing --------------------------------------------
+# mock_net.sh writes the mock DNS servers' log here on every run
+local_offline_testing/mock_dns.log
+*.log
+rec_payload.txt
+malformed53.py
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.pyc
+
+# --- Editor / OS --------------------------------------------------
 *.swp
+*~
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db
