@@ -1,0 +1,16 @@
+sockC tput r1 qps=376981 lat_us=258 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=5.7% 
+sockC tput r2 qps=376790 lat_us=259 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=7.2% 
+sockC tput r3 qps=376603 lat_us=259 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=6.2% 
+sockC tput r4 qps=376192 lat_us=259 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=6.6% 
+sockC tput r5 qps=378569 lat_us=257 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=5.7% 
+sockC lat r1 qps=150000 lat_us=119 lost=0 usr=0.00 sys=0.00 cpu=0.00  sys_busy=11.1% soft=3.48
+sockC lat r2 qps=150000 lat_us=111 lost=0 usr=0.00 sys=0.00 cpu=0.00  sys_busy=11.5% soft=4.38
+sockC lat r3 qps=126193 lat_us=120 lost=128 usr=0.00 sys=0.00 cpu=0.00  sys_busy=11.8% soft=3.46
+C tput r1 qps=377344 lat_us=258 lost=0 usr=9.96 sys=40.04 cpu=50.00 client_busy=5.9% 
+C tput r2 qps=378046 lat_us=257 lost=0 usr=9.88 sys=40.44 cpu=50.32 client_busy=5.8% 
+C tput r3 qps=376941 lat_us=258 lost=0 usr=9.96 sys=40.32 cpu=50.28 client_busy=6.0% 
+C tput r4 qps=376515 lat_us=259 lost=0 usr=10.32 sys=39.88 cpu=50.20 client_busy=6.2% 
+C tput r5 qps=376324 lat_us=259 lost=0 usr=9.76 sys=40.56 cpu=50.32 client_busy=5.9% 
+C lat r1 qps=150000 lat_us=107 lost=0 usr=8.40 sys=27.52 cpu=35.92  sys_busy=11.7% soft=4.56
+C lat r2 qps=150000 lat_us=122 lost=0 usr=11.88 sys=33.56 cpu=45.44  sys_busy=11.4% soft=4.13
+C lat r3 qps=150000 lat_us=104 lost=0 usr=9.32 sys=31.60 cpu=40.92  sys_busy=10.5% soft=3.82

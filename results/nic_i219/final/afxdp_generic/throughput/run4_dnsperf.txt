@@ -1,0 +1,122 @@
+DNS Performance Testing Tool
+Version 2.16.0
+
+[Status] Command line: dnsperf -s 192.168.50.1 -d payload.txt -l 30 -T 4 -c 8 -Q 2000000
+[Status] Sending queries (to 192.168.50.1:53)
+[Status] Started at: Fri Nov  6 06:20:30 2026
+[Status] Stopping after 30.000000 seconds
+[Timeout] Query timed out: msg id 47085
+[Timeout] Query timed out: msg id 47204
+[Timeout] Query timed out: msg id 47221
+[Timeout] Query timed out: msg id 47249
+[Timeout] Query timed out: msg id 47238
+[Timeout] Query timed out: msg id 47248
+[Timeout] Query timed out: msg id 47260
+[Timeout] Query timed out: msg id 47364
+[Timeout] Query timed out: msg id 47521
+[Timeout] Query timed out: msg id 47524
+[Timeout] Query timed out: msg id 47530
+[Timeout] Query timed out: msg id 47532
+[Timeout] Query timed out: msg id 47538
+[Timeout] Query timed out: msg id 47548
+[Timeout] Query timed out: msg id 47687
+[Timeout] Query timed out: msg id 47698
+[Timeout] Query timed out: msg id 48080
+[Timeout] Query timed out: msg id 48279
+[Timeout] Query timed out: msg id 48305
+[Timeout] Query timed out: msg id 48335
+[Timeout] Query timed out: msg id 48343
+[Timeout] Query timed out: msg id 48360
+[Timeout] Query timed out: msg id 48362
+[Timeout] Query timed out: msg id 48364
+[Timeout] Query timed out: msg id 45488
+[Timeout] Query timed out: msg id 45510
+[Timeout] Query timed out: msg id 45640
+[Timeout] Query timed out: msg id 45671
+[Timeout] Query timed out: msg id 45683
+[Timeout] Query timed out: msg id 45754
+[Timeout] Query timed out: msg id 45976
+[Timeout] Query timed out: msg id 45983
+[Timeout] Query timed out: msg id 45991
+[Timeout] Query timed out: msg id 46011
+[Timeout] Query timed out: msg id 46026
+[Timeout] Query timed out: msg id 46019
+[Timeout] Query timed out: msg id 46163
+[Timeout] Query timed out: msg id 46165
+[Timeout] Query timed out: msg id 46175
+[Timeout] Query timed out: msg id 46179
+[Timeout] Query timed out: msg id 46188
+[Timeout] Query timed out: msg id 46724
+[Timeout] Query timed out: msg id 46715
+[Timeout] Query timed out: msg id 46717
+[Timeout] Query timed out: msg id 46721
+[Timeout] Query timed out: msg id 46744
+[Timeout] Query timed out: msg id 46753
+[Timeout] Query timed out: msg id 46745
+[Timeout] Query timed out: msg id 46760
+[Timeout] Query timed out: msg id 45729
+[Timeout] Query timed out: msg id 45889
+[Timeout] Query timed out: msg id 45909
+[Timeout] Query timed out: msg id 45920
+[Timeout] Query timed out: msg id 46251
+[Timeout] Query timed out: msg id 46278
+[Timeout] Query timed out: msg id 46282
+[Timeout] Query timed out: msg id 46312
+[Timeout] Query timed out: msg id 46298
+[Timeout] Query timed out: msg id 46303
+[Timeout] Query timed out: msg id 46305
+[Timeout] Query timed out: msg id 46309
+[Timeout] Query timed out: msg id 46311
+[Timeout] Query timed out: msg id 46313
+[Timeout] Query timed out: msg id 46315
+[Timeout] Query timed out: msg id 46423
+[Timeout] Query timed out: msg id 46429
+[Timeout] Query timed out: msg id 46424
+[Timeout] Query timed out: msg id 46426
+[Timeout] Query timed out: msg id 46428
+[Timeout] Query timed out: msg id 46772
+[Timeout] Query timed out: msg id 46798
+[Timeout] Query timed out: msg id 46800
+[Timeout] Query timed out: msg id 46802
+[Timeout] Query timed out: msg id 46812
+[Timeout] Query timed out: msg id 48471
+[Timeout] Query timed out: msg id 48452
+[Timeout] Query timed out: msg id 48523
+[Timeout] Query timed out: msg id 48615
+[Timeout] Query timed out: msg id 48625
+[Timeout] Query timed out: msg id 48780
+[Timeout] Query timed out: msg id 49017
+[Timeout] Query timed out: msg id 49021
+[Timeout] Query timed out: msg id 49000
+[Timeout] Query timed out: msg id 49002
+[Timeout] Query timed out: msg id 49014
+[Timeout] Query timed out: msg id 49022
+[Timeout] Query timed out: msg id 49024
+[Timeout] Query timed out: msg id 49026
+[Timeout] Query timed out: msg id 49137
+[Timeout] Query timed out: msg id 49812
+[Timeout] Query timed out: msg id 49830
+[Timeout] Query timed out: msg id 49845
+[Timeout] Query timed out: msg id 49860
+[Timeout] Query timed out: msg id 49863
+[Timeout] Query timed out: msg id 49866
+[Timeout] Query timed out: msg id 49878
+[Timeout] Query timed out: msg id 49873
+[Timeout] Query timed out: msg id 49879
+[Timeout] Query timed out: msg id 49885
+[Status] Testing complete (time limit)
+
+Statistics:
+
+  Queries sent:         9308244
+  Queries completed:    9308145 (100.00%)
+  Queries lost:         99 (0.00%)
+
+  Response codes:       NOERROR 9308145 (100.00%)
+  Average packet size:  request 30, response 59
+  Run time (s):         30.000232
+  Queries per second:   310269.100586
+
+  Average Latency (s):  0.000262 (min 0.000044, max 0.005012)
+  Latency StdDev (s):   0.000082
+

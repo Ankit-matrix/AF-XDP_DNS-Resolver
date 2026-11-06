@@ -1,0 +1,9 @@
+Linux 7.0.0-38-generic (divisht-Latitude-5420) 	11/06/2026 	_x86_64_	(8 CPU)
+
+03:17:36 AM   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+03:17:41 AM     0   1518853   15.80   83.20    0.00    0.00   99.00     2  afxdp_resolver
+03:17:46 AM     0   1518853   17.00   82.40    0.00    0.00   99.40     2  afxdp_resolver
+03:17:51 AM     0   1518853   17.20   82.40    0.00    0.20   99.60     2  afxdp_resolver
+03:17:56 AM     0   1518853   16.80   82.60    0.00    0.00   99.40     2  afxdp_resolver
+03:18:01 AM     0   1518853   16.60   83.00    0.00    0.00   99.60     2  afxdp_resolver
+Average:        0   1518853   16.68   82.72    0.00    0.04   99.40     -  afxdp_resolver

@@ -1,0 +1,9 @@
+Linux 7.0.0-38-generic (divisht-Latitude-5420) 	11/06/2026 	_x86_64_	(8 CPU)
+
+02:36:46 AM   UID       PID    %usr %system  %guest   %wait    %CPU   CPU  Command
+02:36:51 AM     0   1487683    8.20   88.80    0.00    0.40   97.00     2  socket_resolver
+02:36:56 AM     0   1487683    9.20   90.40    0.00    0.20   99.60     2  socket_resolver
+02:37:01 AM     0   1487683    8.60   91.00    0.00    0.00   99.60     2  socket_resolver
+02:37:06 AM     0   1487683    9.40   90.20    0.00    0.00   99.60     2  socket_resolver
+02:37:11 AM     0   1487683    9.20   90.40    0.00    0.00   99.60     2  socket_resolver
+Average:        0   1487683    8.92   90.16    0.00    0.12   99.08     -  socket_resolver

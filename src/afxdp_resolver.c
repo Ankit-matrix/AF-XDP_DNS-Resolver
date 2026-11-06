@@ -1,43 +1,41 @@
 /*
- * afxdp_resolver.c — DNS resolver using AF_XDP
+ * afxdp_resolver.c — AF_XDP front-end: client I/O over XSK rings
  *
- * The AF_XDP counterpart to socket_resolver.c.  Both binaries share
- * dns.c, so the ONLY difference in the benchmark is how packets enter
- * and leave the process:
+ * The AF_XDP counterpart to socket_resolver.c.  Both binaries link the
+ * same resolver.c (validation, --local zone, cache, iterative resolution)
+ * and dns.c, so the ONLY difference between them is the client-facing
+ * packet path:
  *
  *   socket_resolver   — recvfrom/sendto over a normal UDP socket
  *   afxdp_resolver    — RX/TX rings on an AF_XDP socket
  *
- * Shared contract:
- *   Receive UDP payload  →  dns_validate_query()
- *                        →  dns_local_lookup()  (--local mode)
- *                        →  dns_build_response()
- *                        →  Send UDP payload
+ * Data path:
+ *   client query  : NIC -> XDP (xdp_kern.o, UDP dst 53) -> XSKMAP -> RX ring
+ *                   -> resolver_handle_query()
+ *   upstream      : ordinary UDP socket owned by resolver.c (root/TLD/auth);
+ *                   replies arrive on an ephemeral port, so XDP passes them
+ *                   to the kernel stack
+ *   client answer : reply callback -> free UMEM frame -> Eth/IPv4/UDP built
+ *                   from the query's saved headers -> TX ring
  *
- * What's different here:
- *   - UMEM + XSKMAP setup (lifted from xsk_rx_test.c, with the three
- *     fixes from setup-fixes.patch baked in from line one)
- *   - A free-frame pool so each TX reply uses a separate UMEM frame,
- *     independent of the RX frame the query arrived in
- *   - rx_to_tx(): header swap (MAC/IP/port) + length fix + IP checksum
- *     recompute + UDP checksum=0, so the reply reaches the client
+ * The query's Ethernet+IPv4+UDP headers are the "client context": the
+ * engine stores them with an in-flight query and hands them back with
+ * the answer, which may come many round trips later.
  *
- * Known limitations (v1, intentional):
- *   - --local mode only (apples-to-apples with socket_resolver --local)
- *   - MAC swap trick assumes the client is on the same L2 segment
- *     (the source MAC of the query is the correct next hop for the
- *     reply).  Valid on the veth testbed and any LAN client; NOT
- *     valid if a router sits between client and server.
- *   - Copy mode (XDP_COPY).  Zero-copy would need an i40e/ice/ixgbe/
- *     mlx5 NIC, not the e1000e this is tested on.
+ * Known limitations:
+ *   - The reply's MACs are the query's MACs swapped, so the client must
+ *     be on the same L2 segment (valid on the veth testbed and a LAN).
+ *   - Copy mode (XDP_COPY), single queue (queue 0), IPv4 only.
  *
  * Build:
- *   clang -O2 -g -target bpf -c xdp_kern.c -o xdp_kern.o
- *   gcc -O3 -Wall -Wextra -o afxdp_resolver afxdp_resolver.c dns.c \
+ *   clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu \
+ *         -c xdp_kern.c -o xdp_kern.o
+ *   gcc -O3 -Wall -Wextra -o afxdp_resolver afxdp_resolver.c resolver.c dns.c \
  *       -lxdp -lbpf
  *
  * Usage:
- *   sudo ./afxdp_resolver --local <interface>
+ *   sudo ./afxdp_resolver <interface> [--local] [--skb|--drv]
+ *     (no --local: recursive resolver; --local: built-in zone, benchmark)
  */
 
 #define _GNU_SOURCE
@@ -62,7 +60,7 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#include "dns.h"
+#include "resolver.h"
 
 /* ================================================================
  * CONFIGURATION
@@ -79,11 +77,21 @@
  * ================================================================ */
 static volatile int running = 1;
 
+static void                *umem_area;
+static struct xsk_ring_prod tx_ring;
+static int                  xsk_fd;
+
 /* Free-frame pool — stack of UMEM offsets available for TX.
  * RX side manages its own frames via the FILL ring; TX frames are
  * allocated from this pool and returned via the COMPLETION ring. */
 static uint64_t free_tx_frames[NUM_FRAMES];
 static int      free_tx_count = 0;
+
+/* Replies built but not yet on the TX ring (flushed in batches). */
+static struct { uint64_t addr; uint32_t len; } tx_batch[TX_BATCH_SIZE];
+static unsigned int tx_batch_n;
+
+static unsigned long rx_pkts, tx_pkts, tx_dropped;
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -104,33 +112,34 @@ static void frame_pool_free(uint64_t addr) {
 }
 
 /* ================================================================
- * PACKET CRAFTING: query frame -> response frame
+ * PACKET CRAFTING: query headers -> response frame
  *
- * Takes the incoming packet (Ethernet + IPv4 + UDP + DNS query),
- * swaps the addresses and ports, replaces the DNS payload with the
- * response payload, and fixes all the lengths and checksums.
- *
- * Returns the new total packet length, or -1 on error.
+ * Takes the query's headers (Ethernet + IPv4 + UDP), swaps the
+ * addresses and ports, appends the DNS response payload, and fixes
+ * all the lengths and checksums.
  * ================================================================ */
 
-/* IPv4 header checksum — RFC 1071 one's complement */
+/* IPv4 header checksum — RFC 1071 one's complement.
+ * Reads the header byte by byte: the fields were just written through
+ * struct iphdr, and reading them back through a uint16_t pointer breaks
+ * C's strict-aliasing rule — at -O3 GCC reordered a store past the read
+ * and produced an off-by-one checksum.  uint8_t access is always legal. */
 static uint16_t ip_checksum(const void *data, int len) {
-    const uint16_t *p = data;
+    const uint8_t *p = data;
     uint32_t sum = 0;
-    while (len > 1) {
-        sum += *p++;
-        len -= 2;
-    }
-    if (len == 1) sum += *(const uint8_t *)p;
+    for (int i = 0; i + 1 < len; i += 2)
+        sum += (uint32_t)((p[i] << 8) | p[i + 1]);
+    if (len & 1)
+        sum += (uint32_t)p[len - 1] << 8;
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    return (uint16_t)~sum;
+    return htons((uint16_t)~sum);
 }
 
 /*
  * Build a reply packet in place.
  *
- * pkt:          start of the frame (Ethernet header)
- * pkt_len:      length of the incoming packet
+ * pkt:          start of the frame, holding a copy of the query's headers
+ * pkt_len:      length of those headers
  * frame_cap:    maximum bytes we can write in this frame
  * dns_payload:  the DNS response bytes to put in
  * dns_len:      length of the DNS response
@@ -185,38 +194,53 @@ static int build_reply_frame(uint8_t *pkt, int pkt_len, int frame_cap,
 }
 
 /* ================================================================
- * DNS PROCESSING (shared with socket_resolver via dns.c)
- *
- * Given the DNS query payload, produce the DNS response payload.
- * Returns response length, or -1 if the query should be dropped.
+ * TX PATH
  * ================================================================ */
-static int process_dns(const uint8_t *query, int query_len,
-                       uint8_t *response, int response_cap) {
-    char qname[256];
-    uint16_t qtype, ctxid;
 
-    if (!dns_validate_query(query, query_len, qname, sizeof(qname),
-                            &qtype, &ctxid))
-        return -1;
+/* Put every batched reply on the TX ring and kick the kernel. */
+static void tx_flush(void) {
+    if (tx_batch_n == 0) return;
 
-    /* Only A and AAAA — NOTIMP for the rest */
-    if (qtype != DNS_TYPE_A && qtype != DNS_TYPE_AAAA) {
-        return dns_build_error(response, response_cap, ctxid, qname,
-                               qtype, DNS_RCODE_NOTIMP);
+    __u32 tx_idx = 0;
+    if (xsk_ring_prod__reserve(&tx_ring, tx_batch_n, &tx_idx) == tx_batch_n) {
+        for (unsigned int i = 0; i < tx_batch_n; i++) {
+            struct xdp_desc *td = xsk_ring_prod__tx_desc(&tx_ring, tx_idx + i);
+            td->addr    = tx_batch[i].addr;
+            td->len     = tx_batch[i].len;
+            td->options = 0;
+        }
+        xsk_ring_prod__submit(&tx_ring, tx_batch_n);
+        tx_pkts += tx_batch_n;
+
+        if (xsk_ring_prod__needs_wakeup(&tx_ring))
+            sendto(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+    } else {
+        /* TX ring full — drop these replies, return frames */
+        for (unsigned int i = 0; i < tx_batch_n; i++)
+            frame_pool_free(tx_batch[i].addr);
+        tx_dropped += tx_batch_n;
+    }
+    tx_batch_n = 0;
+}
+
+/* Reply callback for resolver.c: ctx is the query's Eth+IPv4+UDP headers. */
+static void xsk_reply(const void *ctx, int ctx_len,
+                      const uint8_t *dns, int dns_len) {
+    uint64_t addr = frame_pool_alloc();
+    if (addr == UINT64_MAX) { tx_dropped++; return; }   /* pool exhausted */
+
+    uint8_t *frame = (uint8_t *)umem_area + addr;
+    memcpy(frame, ctx, ctx_len);
+    int len = build_reply_frame(frame, ctx_len, FRAME_SIZE, dns, dns_len);
+    if (len < 0) {
+        frame_pool_free(addr);
+        return;
     }
 
-    /* Local mode: answer from the shared local zone */
-    struct cached_rr ans[MAX_CACHED_RRS];
-    int an_count = 0;
-    uint8_t rcode = DNS_RCODE_NOERROR;
-
-    if (dns_local_lookup(qname, qtype, ans, &an_count) < 0) {
-        rcode = DNS_RCODE_NXDOMAIN;
-        an_count = 0;
-    }
-
-    return dns_build_response(response, response_cap, ctxid, qname,
-                              qtype, rcode, ans, an_count);
+    tx_batch[tx_batch_n].addr = addr;
+    tx_batch[tx_batch_n].len  = (uint32_t)len;
+    if (++tx_batch_n == TX_BATCH_SIZE)
+        tx_flush();
 }
 
 /* ================================================================
@@ -240,15 +264,9 @@ int main(int argc, char *argv[]) {
 
     if (!ifname) {
         fprintf(stderr,
-                "Usage: %s --local <interface> [--skb|--drv]\n"
-                "  (v1 supports --local mode only; interface is required)\n",
+                "Usage: %s <interface> [--local] [--skb|--drv]\n"
+                "  default: recursive resolver;  --local: built-in zone only\n",
                 argv[0]);
-        return 1;
-    }
-
-    if (!local_mode) {
-        fprintf(stderr,
-                "This build only supports --local mode.  Pass --local.\n");
         return 1;
     }
 
@@ -274,7 +292,6 @@ int main(int argc, char *argv[]) {
      * Half of the frames go to RX (pre-filled into the FILL ring);
      * the other half form the TX free-frame pool.
      * ============================================================ */
-    void *umem_area = NULL;
     size_t umem_size = NUM_FRAMES * FRAME_SIZE;
     if (posix_memalign(&umem_area, getpagesize(), umem_size)) {
         perror("posix_memalign");
@@ -307,13 +324,12 @@ int main(int argc, char *argv[]) {
      * ============================================================ */
     struct xsk_socket *xsk = NULL;
     struct xsk_ring_cons rx_ring = {0};     /* patch fix: zero-init */
-    struct xsk_ring_prod tx_ring = {0};
 
     struct xsk_socket_config xsk_cfg = {
         .rx_size        = XSK_RING_CONS__DEFAULT_NUM_DESCS,
         .tx_size        = XSK_RING_PROD__DEFAULT_NUM_DESCS,
         .libbpf_flags   = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags      = 0,    /* generic mode (SKB) — fine for e1000e */
+        .xdp_flags      = 0,    /* program attached below with xdp_mode */
         .bind_flags     = XDP_COPY | XDP_USE_NEED_WAKEUP,
     };
 
@@ -326,7 +342,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int xsk_fd = xsk_socket__fd(xsk);
+    xsk_fd = xsk_socket__fd(xsk);
 
     /* ============================================================
      * 3. Load XDP program and populate XSKMAP
@@ -396,24 +412,31 @@ int main(int argc, char *argv[]) {
     for (__u32 i = umem_cfg.fill_size; i < NUM_FRAMES; i++)
         frame_pool_free((uint64_t)i * FRAME_SIZE);
 
+    /* ============================================================
+     * 5. Resolution engine (shared with socket_resolver)
+     * ============================================================ */
+    int upstream_fd = resolver_init(local_mode, xsk_reply);
+
     fprintf(stderr,
-            "afxdp_resolver on %s (local mode, copy mode, XDP mode: %s)\n"
+            "afxdp_resolver on %s (%s mode, copy mode, XDP mode: %s)\n"
             "  UMEM: %u frames x %u bytes  (RX pre-fill: %u, TX pool: %d)\n",
-            ifname,
+            ifname, local_mode ? "local" : "recursive",
             xdp_mode == XDP_FLAGS_SKB_MODE ? "generic (forced)" :
             xdp_mode == XDP_FLAGS_DRV_MODE ? "native (forced)"  : "auto",
             NUM_FRAMES, FRAME_SIZE,
             umem_cfg.fill_size, free_tx_count);
 
     /* ============================================================
-     * 5. Event loop:  poll → RX → process → TX → wakeup
-     *                      → completions → FILL refill
+     * 6. Event loop:  poll → completions → upstream replies/timeouts
+     *                      → RX → engine → TX → FILL refill
      * ============================================================ */
-    unsigned long rx_pkts = 0, tx_pkts = 0;
-
     while (running) {
-        struct pollfd pfd = { .fd = xsk_fd, .events = POLLIN };
-        int poll_ret = poll(&pfd, 1, 1000);
+        struct pollfd pfd[2] = {
+            { .fd = xsk_fd,      .events = POLLIN },
+            { .fd = upstream_fd, .events = POLLIN },
+        };
+        int poll_ret = poll(pfd, upstream_fd >= 0 ? 2 : 1,
+                            local_mode ? 1000 : 100);
         if (poll_ret < 0 && errno != EINTR) {
             perror("poll");
             break;
@@ -433,7 +456,15 @@ int main(int argc, char *argv[]) {
             xsk_ring_cons__release(&comp_ring, completed);
         }
 
-        /* --- Receive a batch --- */
+        /* --- Upstream replies and timeouts (recursive mode) --- */
+        if (upstream_fd >= 0) {
+            if (poll_ret > 0 && (pfd[1].revents & POLLIN))
+                resolver_handle_upstream();
+            resolver_tick();
+            tx_flush();
+        }
+
+        /* --- Receive a batch of client queries --- */
         __u32 rx_idx = 0;
         unsigned int rcvd = xsk_ring_cons__peek(&rx_ring, RX_BATCH_SIZE,
                                                  &rx_idx);
@@ -442,16 +473,6 @@ int main(int argc, char *argv[]) {
                 recvfrom(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, NULL);
             continue;
         }
-
-        /* --- First pass: build the response payloads, remember which
-         * RX frames need to be transmitted (and with what length).
-         * Reserve TX slots only after we know the exact count — libxdp
-         * requires submit==reserve. --- */
-        struct tx_plan {
-            uint64_t addr;
-            uint32_t len;
-        } plan[RX_BATCH_SIZE];
-        unsigned int planned = 0;
 
         for (unsigned int i = 0; i < rcvd; i++) {
             const struct xdp_desc *rx_desc =
@@ -486,35 +507,12 @@ int main(int argc, char *argv[]) {
             int udp_data_len = (int)rx_len - udp_data_off;
             if (udp_data_len <= 0) continue;
 
-            uint8_t *dns_query = rx_pkt + udp_data_off;
-
-            /* Build DNS response via shared dns.c */
-            uint8_t dns_response[DNS_BUF_SIZE];
-            int dns_resp_len = process_dns(dns_query, udp_data_len,
-                                           dns_response,
-                                           sizeof(dns_response));
-            if (dns_resp_len <= 0) continue;
-
-            /* Grab a TX frame from the pool */
-            uint64_t tx_addr = frame_pool_alloc();
-            if (tx_addr == UINT64_MAX) break;  /* pool exhausted */
-
-            uint8_t *tx_pkt = (uint8_t *)umem_area + tx_addr;
-            int header_bytes = udp_data_off;
-            memcpy(tx_pkt, rx_pkt, header_bytes);
-
-            int tx_len = build_reply_frame(tx_pkt, header_bytes,
-                                           FRAME_SIZE,
-                                           dns_response, dns_resp_len);
-            if (tx_len < 0) {
-                frame_pool_free(tx_addr);
-                continue;
-            }
-
-            plan[planned].addr = tx_addr;
-            plan[planned].len  = (uint32_t)tx_len;
-            planned++;
+            /* Hand the DNS payload to the shared engine; the frame's
+             * headers are the client context for the reply. */
+            resolver_handle_query(rx_pkt + udp_data_off, udp_data_len,
+                                  rx_pkt, udp_data_off);
         }
+        tx_flush();
 
         /* --- Release the RX batch and recycle its frames into FILL --- */
         __u32 fill_idx = 0;
@@ -529,36 +527,25 @@ int main(int argc, char *argv[]) {
         }
         xsk_ring_cons__release(&rx_ring, rcvd);
 
-        /* --- Reserve exactly `planned` TX slots and commit them --- */
-        if (planned > 0) {
-            __u32 tx_idx = 0;
-            unsigned int got = xsk_ring_prod__reserve(&tx_ring, planned,
-                                                      &tx_idx);
-            if (got == planned) {
-                for (unsigned int i = 0; i < planned; i++) {
-                    struct xdp_desc *td =
-                        xsk_ring_prod__tx_desc(&tx_ring, tx_idx + i);
-                    td->addr    = plan[i].addr;
-                    td->len     = plan[i].len;
-                    td->options = 0;
-                }
-                xsk_ring_prod__submit(&tx_ring, planned);
-                tx_pkts += planned;
-
-                if (xsk_ring_prod__needs_wakeup(&tx_ring))
-                    sendto(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
-            } else {
-                /* TX ring full — drop these replies, return frames */
-                for (unsigned int i = 0; i < planned; i++)
-                    frame_pool_free(plan[i].addr);
-            }
-        }
-
         if (xsk_ring_prod__needs_wakeup(&fill_ring))
             recvfrom(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, NULL);
     }
 
-    fprintf(stderr, "\nafxdp_resolver: RX=%lu TX=%lu\n", rx_pkts, tx_pkts);
+    fprintf(stderr, "\nafxdp_resolver: RX=%lu TX=%lu TX_dropped=%lu\n",
+            rx_pkts, tx_pkts, tx_dropped);
+
+    /* Kernel-side AF_XDP drop counters: non-zero rx_ring_full / fill_empty
+     * means the 2048-entry rings (or the loop draining them) were too slow. */
+    struct xdp_statistics st;
+    socklen_t sl = sizeof(st);
+    if (getsockopt(xsk_fd, SOL_XDP, XDP_STATISTICS, &st, &sl) == 0)
+        fprintf(stderr, "xsk stats: rx_dropped=%llu rx_ring_full=%llu "
+                        "fill_empty=%llu tx_invalid=%llu tx_ring_empty=%llu\n",
+                (unsigned long long)st.rx_dropped,
+                (unsigned long long)st.rx_ring_full,
+                (unsigned long long)st.rx_fill_ring_empty_descs,
+                (unsigned long long)st.tx_invalid_descs,
+                (unsigned long long)st.tx_ring_empty_descs);
 
 detach:
     bpf_xdp_detach(ifindex, xdp_mode, NULL);

@@ -1,0 +1,16 @@
+sockC tput r1 qps=241019 lat_us=266 lost=204 usr=5.52 sys=42.88 cpu=48.40 client_busy=6.7% hotcore=CPU2 50% soft=0.00 requeues=299211) 
+sockC tput r2 qps=376797 lat_us=259 lost=0 usr=9.04 sys=73.20 cpu=82.24 client_busy=6.2% hotcore=CPU2 83% soft=0.00 requeues=320556) 
+sockC tput r3 qps=371447 lat_us=263 lost=0 usr=9.48 sys=74.36 cpu=83.84 client_busy=6.5% hotcore=CPU2 85% soft=0.00 requeues=356034) 
+sockC tput r4 qps=357773 lat_us=273 lost=0 usr=9.36 sys=72.04 cpu=81.40 client_busy=7.3% hotcore=CPU1 89% soft=87.93 requeues=401218) 
+sockC tput r5 qps=327556 lat_us=300 lost=0 usr=9.96 sys=81.64 cpu=91.60 client_busy=7.1% hotcore=CPU1 93% soft=89.82 requeues=426408) 
+sockC lat r1 qps=150000 lat_us=119 lost=0 usr=3.96 sys=30.60 cpu=34.56    sys_busy=13.9% soft=4.92
+sockC lat r2 qps=150000 lat_us=123 lost=0 usr=3.92 sys=32.16 cpu=36.08    sys_busy=17.7% soft=5.94
+sockC lat r3 qps=150000 lat_us=115 lost=0 usr=3.96 sys=31.60 cpu=35.56    sys_busy=16.4% soft=6.53
+C tput r1 qps=373252 lat_us=262 lost=0 usr=6.76 sys=30.84 cpu=37.60 client_busy=6.4% hotcore=CPU1 69% soft=65.05 requeues=447811) 
+C tput r2 qps=374235 lat_us=261 lost=0 usr=7.16 sys=30.72 cpu=37.88 client_busy=6.5% hotcore=CPU1 71% soft=66.69 requeues=519922) 
+C tput r3 qps=372264 lat_us=262 lost=0 usr=6.88 sys=30.24 cpu=37.12 client_busy=6.6% hotcore=CPU1 68% soft=64.37 requeues=560729) 
+C tput r4 qps=310269 lat_us=262 lost=99 usr=5.56 sys=25.36 cpu=30.92 client_busy=5.5% hotcore=CPU1 62% soft=55.47 requeues=675823) 
+C tput r5 qps=373125 lat_us=262 lost=0 usr=6.48 sys=30.32 cpu=36.80 client_busy=7.0% hotcore=CPU1 68% soft=64.71 requeues=762915) 
+C lat r1 qps=150000 lat_us=117 lost=0 usr=2.72 sys=12.56 cpu=15.28    sys_busy=12.4% soft=5.77
+C lat r2 qps=150000 lat_us=119 lost=0 usr=2.72 sys=13.08 cpu=15.80    sys_busy=13.6% soft=5.58
+C lat r3 qps=149882 lat_us=131 lost=0 usr=2.64 sys=12.60 cpu=15.24    sys_busy=12.8% soft=5.41

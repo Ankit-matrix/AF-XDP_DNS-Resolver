@@ -1,0 +1,24 @@
+sock tput r1 qps=306015 lat_us=305 lost=0 usr=8.92 sys=90.16 cpu=99.08 
+sock tput r2 qps=312640 lat_us=303 lost=0 usr=9.24 sys=90.08 cpu=99.32 
+sock tput r3 qps=312144 lat_us=303 lost=0 usr=9.04 sys=90.44 cpu=99.48 
+sock tput r4 qps=309891 lat_us=303 lost=0 usr=9.08 sys=90.24 cpu=99.32 
+sock tput r5 qps=310774 lat_us=304 lost=0 usr=9.24 sys=90.08 cpu=99.32 
+sock lat r1 qps=149999 lat_us=11 lost=0 usr=6.32 sys=63.52 cpu=69.84 sys_busy=29.5% soft=6.16
+sock lat r2 qps=149999 lat_us=11 lost=0 usr=5.64 sys=64.05 cpu=69.69 sys_busy=29.7% soft=6.20
+sock lat r3 qps=149999 lat_us=11 lost=0 usr=5.92 sys=63.73 cpu=69.65 sys_busy=29.4% soft=6.13
+A tput r1 qps=524272 lat_us=9 lost=0 usr=12.76 sys=60.08 cpu=72.84 
+A tput r2 qps=539620 lat_us=7 lost=0 usr=17.52 sys=82.00 cpu=99.52 
+A tput r3 qps=536143 lat_us=8 lost=0 usr=16.68 sys=82.72 cpu=99.40 
+A tput r4 qps=531399 lat_us=7 lost=0 usr=16.96 sys=82.44 cpu=99.40 
+A tput r5 qps=504569 lat_us=11 lost=0 usr=16.56 sys=82.16 cpu=98.72 
+A lat r1 qps=150000 lat_us=13 lost=0 usr=8.28 sys=52.02 cpu=60.30 sys_busy=32.0% soft=4.35
+A lat r2 qps=150000 lat_us=9 lost=0 usr=11.36 sys=48.40 cpu=59.76 sys_busy=31.8% soft=5.34
+A lat r3 qps=149999 lat_us=9 lost=0 usr=10.44 sys=49.04 cpu=59.48 sys_busy=31.5% soft=5.04
+B tput r1 qps=487563 lat_us=9 lost=0 usr=17.12 sys=81.32 cpu=98.44 
+B tput r2 qps=494510 lat_us=8 lost=0 usr=16.76 sys=82.28 cpu=99.04 
+B tput r3 qps=486489 lat_us=9 lost=0 usr=17.08 sys=81.96 cpu=99.04 
+B tput r4 qps=491345 lat_us=8 lost=0 usr=16.84 sys=82.16 cpu=99.00 
+B tput r5 qps=492899 lat_us=8 lost=0 usr=17.36 sys=81.40 cpu=98.76 
+B lat r1 qps=150000 lat_us=9 lost=0 usr=8.44 sys=51.20 cpu=59.64 sys_busy=30.7% soft=4.10
+B lat r2 qps=149999 lat_us=9 lost=0 usr=8.44 sys=51.08 cpu=59.52 sys_busy=30.7% soft=4.22
+B lat r3 qps=149999 lat_us=9 lost=0 usr=10.56 sys=49.08 cpu=59.64 sys_busy=31.1% soft=5.43

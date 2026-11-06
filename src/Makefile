@@ -4,7 +4,10 @@
 #   socket_resolver   — baseline resolver (normal UDP sockets)
 #   xdp_kern.o        — BPF object (XDP redirect program)
 #   xsk_rx_test       — AF_XDP receive-only test tool
-#   afxdp_resolver    — AF_XDP resolver (local mode)
+#   afxdp_resolver    — AF_XDP resolver (recursive + local mode)
+#
+# Both resolvers link the shared engine resolver.c (iterative resolution,
+# cache) and dns.c (wire format); only their client-side I/O differs.
 #
 # Prerequisites:
 #   sudo apt install -y clang llvm libbpf-dev libxdp-dev \
@@ -28,16 +31,20 @@ XDP_LIBS = -lxdp -lbpf
 ASAN_FLAGS = -g -O1 -Wall -Wextra -fsanitize=address,undefined \
              -fno-sanitize=alignment
 
+# Shared engine linked into both resolvers
+ENGINE_SRC = resolver.c dns.c
+ENGINE_HDR = resolver.h dns.h
+
 .PHONY: all clean
 
 all: socket_resolver xdp_kern.o xsk_rx_test afxdp_resolver
 
 # --- Baseline resolver (normal sockets) ---
-socket_resolver: socket_resolver.c dns.c dns.h
-	$(CC) $(CFLAGS) -o $@ socket_resolver.c dns.c $(LDFLAGS)
+socket_resolver: socket_resolver.c $(ENGINE_SRC) $(ENGINE_HDR)
+	$(CC) $(CFLAGS) -o $@ socket_resolver.c $(ENGINE_SRC) $(LDFLAGS)
 
-socket_resolver_asan: socket_resolver.c dns.c dns.h
-	$(CC) $(ASAN_FLAGS) -o $@ socket_resolver.c dns.c
+socket_resolver_asan: socket_resolver.c $(ENGINE_SRC) $(ENGINE_HDR)
+	$(CC) $(ASAN_FLAGS) -o $@ socket_resolver.c $(ENGINE_SRC)
 
 # --- XDP BPF program ---
 xdp_kern.o: xdp_kern.c
@@ -48,11 +55,11 @@ xsk_rx_test: xsk_rx_test.c
 	$(CC) $(CFLAGS) -o $@ $< $(XDP_LIBS)
 
 # --- AF_XDP resolver ---
-afxdp_resolver: afxdp_resolver.c dns.c dns.h
-	$(CC) $(CFLAGS) -o $@ afxdp_resolver.c dns.c $(XDP_LIBS)
+afxdp_resolver: afxdp_resolver.c $(ENGINE_SRC) $(ENGINE_HDR)
+	$(CC) $(CFLAGS) -o $@ afxdp_resolver.c $(ENGINE_SRC) $(XDP_LIBS)
 
-afxdp_resolver_asan: afxdp_resolver.c dns.c dns.h
-	$(CC) $(ASAN_FLAGS) -o $@ afxdp_resolver.c dns.c $(XDP_LIBS)
+afxdp_resolver_asan: afxdp_resolver.c $(ENGINE_SRC) $(ENGINE_HDR)
+	$(CC) $(ASAN_FLAGS) -o $@ afxdp_resolver.c $(ENGINE_SRC) $(XDP_LIBS)
 
 clean:
 	rm -f socket_resolver socket_resolver_asan \
