@@ -1,0 +1,3163 @@
+check this repo and validate the code files - then give me the steps to set the environment for testing on ubuntu linux (do it end to end like from the nic driver to the dns resolution - we are using recursive query and iterative dns resolver)
+
+I'll unpack the repo, review the code and try building it, then write up the end-to-end Ubuntu setup.
+
+Read everything. Now compiling each target (with ASan + strict warnings) to see what actually builds.
+
+Userspace builds cleanly. Now the BPF object and the XSK test (needs libxdp/libbpf), plus a clang pass for extra warnings.
+
+BPF object fails to compile (missing `IPPROTO_UDP` include). Let me check whether this sandbox lets me run XDP/veth so I can test the packet path for real, and whether root servers are reachable.
+
+Testbed works. Now the recursive resolver (ASan build) over the veth, queried from the client namespace:
+
+Every query comes back NXDOMAIN in ~4 ms, which is too fast to be real root servers. Checking whether this sandbox's network intercepts DNS:
+
+The mock root answers with a real referral. Now the resolver through the full chain: client namespace → veth → resolver → mock root → TLD → authoritative.
+
+Recursion works for the basic path (root → TLD → auth, caching, NXDOMAIN, NOTIMP). It breaks on CNAMEs, NODATA and glueless delegations; details below. Now the AF_XDP receive path on the veth:
+
+The sandbox forbids raising the memlock limit. On kernel 5.11+ BPF memory is charged to the cgroup anyway, so I'll make that step non-fatal in the scratch copy and carry on:
+
+It didn't hit the fill-ring failure I expected, so I'm checking the libxdp default ring size, then sending real DNS packets at it:
+
+Patch applies and builds cleanly. Now the setup guide:
+
+I built and ran everything on Ubuntu 24.04 with AF_XDP enabled. The repo has a working socket-based iterative resolver and a working XDP → AF_XDP receive path, but **there is no AF_XDP resolver yet**. `testbed.sh` and `dns.h` refer to an `afxdp_resolver`, and it isn't in the zip. So the comparison described in your project spec can't be run until that file is written.
+
+**What works, all run here:**
+- **Basic recursion:** the iterative resolver (`socket_resolver.c` + `dns.c`) walks root → TLD → authoritative correctly. Repeat queries come from the cache in 0 ms. NXDOMAIN and NOTIMP replies are correct.
+- **Malformed packets:** all 7 are dropped and the valid control query gets an answer, with no AddressSanitizer errors.
+- **XDP filter:** port-53 traffic on the veth goes to the AF_XDP socket, other ports go to the normal kernel stack, and the program detaches cleanly on Ctrl-C.
+
+**Two bugs that stop setup** (fixed in `setup-fixes.patch`):
+- `xdp_kern.c` doesn't compile because it's missing `#include <linux/in.h>`.
+- `xsk_rx_test.c` starts or fails at random. The rings are never initialised, and it reserves 4096 entries in a FILL ring that only holds 2048. I saw it pass on one run and fail on the next.
+
+**Resolver bugs I reproduced:**
+1. **Every CNAME query fails on the client side.** The reply's question becomes the CNAME target, so `dig` rejects it ("Question section mismatch") and times out. This hits `www.github.com`, `www.google.com` and most real sites.
+2. **A query for a record type that doesn't exist returns SERVFAIL instead of an empty answer.** Any AAAA query for an IPv4-only name, such as `github.com AAAA`, fails this way.
+3. **Delegations without glue records return SERVFAIL.**
+
+From reading the code there are also two security issues: an out-of-bounds read when a record's data is over 512 bytes, and replies being matched on transaction ID and source IP only. All of these, with suggested fixes, are in section 9 of the guide. I didn't change the resolver code itself, since you'll want to go through each fix line by line before it goes in.
+
+**Testing note:** the sandbox I used intercepts all DNS traffic, so I couldn't resolve against the real Internet. I tested recursion against `mock_dns.py`, a set of fake root, TLD and authoritative servers on the real root-server IPs. On your machine, run the reachability check in section 1.4 of the guide first. Campus networks often block outbound DNS to arbitrary servers; if IITGN's does, use a hotspot or the mock.
+
+`TESTING_UBUNTU.md` covers the full setup in order with a pass check per stage: packages and kernel checks, freeing port 53 from systemd-resolved, NIC driver and XDP support, queue and offload settings, build, the veth testbed, local, recursive and mock-hierarchy tests, the XDP/AF_XDP check, and the benchmark method for when the AF_XDP resolver exists.
+
+The natural next step is writing the AF_XDP resolver; section 8 of the guide lists what it needs.
+
+HOW TO RUN THIS PATCH FILE
+
+Run it with the standard `patch` tool from inside the repo folder:
+
+```bash
+# 1. Go into the repo folder (the one with xdp_kern.c in it)
+cd ~/path/to/AF_XDP-DNS-Resolver-main
+
+# 2. Put setup-fixes.patch in this folder (or give its full path below)
+
+# 3. Dry run: shows what would change without touching anything
+patch -p1 --dry-run < setup-fixes.patch
+
+# 4. Apply it for real
+patch -p1 < setup-fixes.patch
+```
+
+A successful run prints:
+
+```
+patching file xdp_kern.c
+patching file xsk_rx_test.c
+```
+
+**What `-p1` does:** the patch names files as `a/xdp_kern.c` and `b/xdp_kern.c`. `-p1` strips that first `a/` or `b/` so the names match the files in your current folder.
+
+**Check that it worked** by rebuilding both files:
+
+```bash
+clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c xdp_kern.c -o xdp_kern.o
+gcc -O2 -Wall -Wextra -o xsk_rx_test xsk_rx_test.c -lxdp -lbpf
+```
+
+Both should compile with no errors.
+
+**If something goes wrong:**
+- **`can't find file to patch`:** you're in the wrong folder. `cd` into the one that contains `xdp_kern.c`.
+- **`Reversed (or previously applied) patch detected`:** it's already applied. Answer `n` and skip it.
+- **`Hunk FAILED`:** your copy of the file differs from the zip you sent me. Tell me what changed and I'll regenerate the patch.
+- **To undo the patch:** `patch -p1 -R < setup-fixes.patch`
+
+If the repo is a git clone, `git apply setup-fixes.patch` also works. Add `--check` first for a dry run.divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c xdp_kern.c -o xdp_kern.o
+xdp_kern.c:21:10: fatal error: 'bpf/bpf_helpers.h' file not found
+   21 | #include <bpf/bpf_helpers.h>
+      |          ^~~~~~~~~~~~~~~~~~~
+1 error generated.
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ gcc -O2 -Wall -Wextra -o xsk_rx_test xsk_rx_test.c -lxdp -lbpf
+xsk_rx_test.c:38:10: fatal error: xdp/xsk.h: No such file or directory
+   38 | #include <xdp/xsk.h>
+      |          ^~~~~~~~~~~
+compilation terminated.
+
+No. Nothing in the current setup is zero-copy, for three reasons:
+
+1. **The code asks for copy mode.** `xsk_rx_test.c` binds the socket with `XDP_COPY` in `.bind_flags`, which explicitly requests copy mode.
+2. **veth can't do zero-copy.** The veth driver supports native XDP but not AF_XDP zero-copy, so the testbed falls back to copy mode whatever flag you pass.
+3. **Divisht's laptop NICs can't do it either.** `e1000e` and `iwlwifi` only support generic (SKB) XDP, which is the slowest mode.
+
+**What copy mode still gets you.** The packet is still taken at the XDP hook and delivered straight into your UMEM. That skips SKB allocation, the IP/UDP stack, socket lookup and the `recvfrom` syscall path. The one thing you lose is that the driver copies the payload once into your UMEM frame instead of DMA-ing it there directly. Copy mode therefore still shows a real difference against the socket baseline. It just isn't the zero-copy result.
+
+There are three AF_XDP modes:
+
+| Mode | How the packet reaches UMEM | Where you get it |
+|---|---|---|
+| Generic (SKB) | Kernel builds an SKB, then copies it | Any NIC; `e1000e`/`iwlwifi` |
+| Native, copy | Driver runs XDP, then copies into UMEM | veth, `igb`, `virtio_net`, etc. |
+| Native, zero-copy | NIC DMAs straight into UMEM | `i40e`, `ice`, `ixgbe`, `mlx5`, `igc`, etc. |
+
+**To actually get zero-copy you'd need three things:**
+- A ZC-capable NIC, typically an Intel X710/E810/X520 or a Mellanox ConnectX-4 or newer. A lab server may well have one. Check with `ethtool -i <interface>`.
+- `.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP` and `XDP_FLAGS_DRV_MODE` when attaching. Then the bind fails loudly if zero-copy isn't available, instead of silently falling back.
+- Two machines: a client running dnsperf and the resolver host, connected through that NIC.
+
+You can check which mode you actually got by reading it back after the socket is created:
+
+```c
+struct xdp_options opts; socklen_t len = sizeof(opts);
+getsockopt(xsk_socket__fd(xsk), SOL_XDP, XDP_OPTIONS, &opts, &len);
+printf("zero-copy: %s\n", (opts.flags & XDP_OPTIONS_ZEROCOPY) ? "yes" : "no");
+```
+
+**For your report:** the project spec talks about "zero-copy performance benefits". If all your measurements come from veth or these laptops, describe them as AF_XDP **copy mode**, and present zero-copy as the next step on suitable hardware. Calling a veth result zero-copy is the sort of thing an examiner would catch in a viva.divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ss -ulpn 'sport = :53'
+State     Recv-Q    Send-Q       Local Address:Port        Peer Address:Port    Process                                                                         
+UNCONN    0         0               127.0.0.54:53               0.0.0.0:*        users:(("systemd-resolve",pid=684,fd=16))                                      
+UNCONN    0         0            127.0.0.53%lo:53               0.0.0.0:*        users:(("systemd-resolve",pid=684,fd=14))
+
+That binary doesn't exist yet. `socket_resolver_asan` is created by the build step in section 3 of the guide, and you haven't run that step. Build it first:
+
+```bash
+cd ~/AF_XDP-DNS-Resolver
+gcc -g -O1 -Wall -Wextra -fsanitize=address,undefined -o socket_resolver_asan socket_resolver.c dns.c
+ls -l socket_resolver_asan        # should now exist and be executable
+sudo ./socket_resolver_asan --local
+```
+
+While you're there, build the rest so the later steps don't fail the same way:
+
+```bash
+gcc -O3 -Wall -Wextra -o socket_resolver socket_resolver.c dns.c
+clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c xdp_kern.c -o xdp_kern.o
+gcc -O2 -Wall -Wextra -o xsk_rx_test xsk_rx_test.c -lxdp -lbpf
+```
+
+The last two need `libbpf-dev` and `libxdp-dev`, the packages from the earlier error. If those aren't installed yet, the first two binaries will still build.
+
+If the gcc line itself fails, run `ls *.c *.h`. You should see `socket_resolver.c`, `dns.c` and `dns.h` in that folder. If not, send me the error.
+
+`enp3s0` in the guide was a placeholder, and it isn't on this laptop. Its two real NICs are:
+
+- `enp0s31f6`: the wired Ethernet port. It shows `NO-CARRIER`, so no cable is plugged in.
+- `wlp0s20f3`: the Wi-Fi, which is what the laptop is currently online through.
+
+Everything else in that list belongs to Docker (`docker0`, `br-*`, and the `veth*@if*` entries); leave those alone.
+
+Run the checks against the real names:
+
+```bash
+for IF in enp0s31f6 wlp0s20f3; do
+  echo "=== $IF"
+  ethtool -i $IF | grep -E 'driver|version'
+  ethtool -l $IF 2>&1 | grep -A4 Current
+done
+```
+
+I expect `e1000e` for the wired port and `iwlwifi` for Wi-Fi. If so, neither has native XDP, so **skip section 2 of the guide on this laptop**. It only applies to a physical NIC you plan to benchmark on. Go straight to the veth testbed in section 4. That gives you native XDP in copy mode, which is enough for everything except a zero-copy measurement.
+
+One check before running `testbed.sh`: Docker is running, and the testbed uses `10.0.0.0/24`. Make sure nothing already uses that subnet:
+
+```bash
+ip -br addr | grep '10\.0\.0\.'
+```
+
+If that prints nothing, run the testbed:
+
+```bash
+sudo ./testbed.sh teardown
+sudo ./testbed.sh setup
+sudo ./testbed.sh status
+sudo ip netns exec dnstest ping -c1 10.0.0.1
+```
+
+If the grep does print something, one of Docker's networks overlaps with the testbed. Tell me and I'll give you a different subnet to use.
+
+for IF in enp0s31f6 wlp0s20f3; do
+  echo "=== $IF"
+  ethtool -i $IF | grep -E 'driver|version'
+  ethtool -l $IF 2>&1 | grep -A4 Current
+done
+=== enp0s31f6
+driver: e1000e
+version: 7.0.0-38-generic
+firmware-version: 0.8-4
+expansion-rom-version: 
+=== wlp0s20f3
+driver: iwlwifi
+version: 7.0.0-38-generic
+firmware-version: 77.b405f9d4.0 QuZ-a0-hr-b0-77.u
+expansion-rom-version: 
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver
+for IF in enp0s31f6 wlp0s20f3; do
+  echo "=== $IF"
+  ethtool -i $IF | grep -E 'driver|version'
+  ethtool -l $IF 2>&1 | grep -A4 Current
+done
+=== enp0s31f6
+driver: e1000e
+version: 7.0.0-38-generic
+firmware-version: 0.8-4
+expansion-rom-version: 
+=== wlp0s20f3
+driver: iwlwifi
+version: 7.0.0-38-generic
+firmware-version: 77.b405f9d4.0 QuZ-a0-hr-b0-77.u
+expansion-rom-version: 
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver
+
+That confirms it: wired is `e1000e`, Wi-Fi is `iwlwifi`, and neither supports native XDP. The `ethtool -l` lines printed nothing because neither driver reports multiple queues. So this laptop's own NICs are out for AF_XDP benchmarking, and you develop and test on the veth testbed instead. Kernel 7.0 is fine for everything in the guide.
+
+Next steps, in order:
+
+```bash
+# 1. Make sure Docker isn't using 10.0.0.x (should print nothing)
+ip -br addr | grep '10\.0\.0\.'
+
+# 2. Create the testbed
+sudo ./testbed.sh teardown
+sudo ./testbed.sh setup
+sudo ./testbed.sh status
+sudo ip netns exec dnstest ping -c1 10.0.0.1
+
+# 3. Start the resolver (terminal 1)
+sudo ./socket_resolver_asan --local
+
+# 4. Query it from the client namespace (terminal 2)
+sudo ip netns exec dnstest dig @10.0.0.1 github.com A +short         # expect 140.82.121.3
+sudo ip netns exec dnstest dig @10.0.0.1 nothere.com A | grep status  # expect NXDOMAIN
+```
+
+If step 3 says `command not found`, build it first with the gcc line from my earlier message. Paste the output of steps 2 and 4 and we'll move on to recursive mode.Fair enough. Option 3 it is — run both veth and the real NIC, write up what the hardware actually delivers.
+Keeps the project honest and full. A smaller speedup backed by a clear explanation of why (driver support, generic vs native mode, SKB allocation path) is a stronger submission than inflated numbers on a borrowed box you can't reproduce. And if the AF_XDP binary comes in roughly tied with sockets, that's genuinely interesting — it means the socket path on modern Linux is remarkably well-optimized for this kind of workload, which is itself a finding worth two paragraphs in the report.
+Updated plan for benchmarks (when we get there):
+veth testbed, generic XDP, copy mode — isolated, reproducible baseline comparison
+enp0s31f6 (your I219-LM), generic XDP, copy mode — real NIC numbers
+Report both, name the hardware constraint, explain what zero-copy on ixgbe/i40e would change
+Nothing in the code changes. The bind flags XDP_COPY | XDP_USE_NEED_WAKEUP and the generic XDP mode (default — we never set XDP_FLAGS_DRV_MODE) are already correct for this hardware. Good — means we didn't build toward something your NIC can't do.
+Back to where we were: your teammate needs to install the dev packages, then run the first three tests I listed earlier (build socket_resolver + xdp_kern.o, testbed.sh setup, run xsk_rx_test to confirm AF_XDP actually receives packets). Once that works, I'll write afxdp_resolver.c.
+Anything else to sort out before we push forward, or should we wait for your teammate to run those three steps?The plan holds up, but three points in that message are wrong or missing, and they change what you'll write in the report.
+
+**1. The veth arm won't be generic XDP.** The code attaches with `bpf_xdp_attach(ifindex, prog_fd, 0, NULL)`. Flags of 0 means "native if the driver supports it, otherwise generic". veth supports native XDP, so on veth you get **native, copy mode**. On `e1000e` it falls back to **generic, copy mode**. In my test run here, the veth showed `prog/xdp` (native) rather than `xdpgeneric`.
+
+That makes your two arms differ on two variables at once: the XDP mode and virtual vs. physical hardware. It's still a useful contrast, but label it correctly, and set the mode explicitly so the kernel isn't choosing it for you:
+
+```c
+bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL);   // force generic
+// or XDP_FLAGS_DRV_MODE to force native; this fails loudly on e1000e
+```
+
+The cleanest experimental design is three configurations:
+
+| Config | Interface | XDP mode |
+|---|---|---|
+| A | veth | generic (forced) |
+| B | veth | native |
+| C | `enp0s31f6` | generic |
+
+- **A vs. B** isolates the effect of the XDP mode on the same link.
+- **A vs. C** shows the effect of a real NIC under the same mode.
+
+After each attach, record the mode you actually got with `ip -d link show <if> | grep -o 'xdp[a-z]*'`.
+
+**2. "Nothing in the code changes" isn't quite true.** `setup-fixes.patch` still has to be applied. Without it `xdp_kern.o` doesn't compile and `xsk_rx_test` starts only some of the time. Also, the CNAME and NODATA bugs don't affect `--local` benchmarks, but they will show up in any recursive-mode test.
+
+**3. Benchmarking on the real NIC needs a second machine.** `enp0s31f6` currently shows `NO-CARRIER`. You can't send dnsperf traffic at the laptop's own address, because the kernel routes it through `lo` and it never reaches the NIC or the XDP hook. So you need a second computer, for example a teammate's laptop, connected by an Ethernet cable directly or through a switch. Give both ends static IPs and run dnsperf from the other machine. Arrange the hardware now so it doesn't hold you up later.
+
+Two smaller points:
+- Check whether the NIC is actually an I219-LM or an I219-V with `lspci | grep -i ethernet`, so the report names the hardware correctly.
+- In generic mode, AF_XDP can come out *slower* than sockets for a single-threaded resolver. Frames still get SKBs, and you pay for ring management on top. If that happens, it supports the same finding the message describes, so frame it in those terms rather than as a failure.
+
+**Next step:** yes, wait for your teammate. The three steps that gate everything are:
+1. Install the dev packages, apply the patch, and build.
+2. `testbed.sh setup`.
+3. `xsk_rx_test veth-dns`, with one dig on port 53 showing up and one on port 5300 not showing up.
+
+Once those pass, write `afxdp_resolver.c` against the requirements in section 8 of the guide. The two that most often go wrong are:
+- **Checksums on TX:** recompute the IPv4 header checksum, and either compute the UDP checksum or set it to 0.
+- **Keeping the upstream leg on a normal UDP socket:** otherwise you also need ARP/MAC handling for the hops to root, TLD and authoritative servers.
+
+sudo ./testbed.sh teardown
+sudo: ./testbed.sh: command not found
+
+That message almost always means the script isn't marked executable. Files extracted from a zip often lose their execute bit. Fix it and retry:
+
+```bash
+cd ~/AF_XDP-DNS-Resolver
+ls -l testbed.sh          # no 'x' in the permissions (e.g. -rw-rw-r--) confirms it
+chmod +x testbed.sh
+sudo ./testbed.sh teardown
+sudo ./testbed.sh setup
+```
+
+You can also skip the permission and run it through bash:
+
+```bash
+sudo bash testbed.sh setup
+```
+
+If `ls` says `No such file or directory`, you're in the wrong folder. Run `ls`, then `cd` into the folder that contains `testbed.sh`, `dns.c` and the other files.
+
+If you instead get `/usr/bin/env: 'bash\r': No such file or directory`, the file has Windows line endings. Fix them with:
+
+```bash
+sed -i 's/\r$//' testbed.sh
+```
+
+sudo ./testbed.sh teardown
+sudo: ./testbed.sh: command not found
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ ls -l testbed.sh   
+-rw-rw-r-- 1 divisht divisht 3433 Nov  5 23:59 testbed.sh
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ chmod +x testbed.sh
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ./testbed.sh teardown
+=== Tearing down test network ===
+=== Done ===
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ 
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ./testbed.sh setup
+=== Creating test network ===
+Note: ethtool -L failed (veth may only support 1 queue already)
+Actual changes:
+tx-checksum-ip-generic: off
+tx-tcp-segmentation: off [not requested]
+tx-tcp-ecn-segmentation: off [not requested]
+tx-tcp-mangleid-segmentation: off [not requested]
+tx-tcp6-segmentation: off [not requested]
+tx-udp-segmentation: off [not requested]
+tx-checksum-sctp: off
+rx-checksum: off
+Actual changes:
+tx-checksum-ip-generic: off
+tx-tcp-segmentation: off [not requested]
+tx-tcp-ecn-segmentation: off [not requested]
+tx-tcp-mangleid-segmentation: off [not requested]
+tx-tcp6-segmentation: off [not requested]
+tx-udp-segmentation: off [not requested]
+tx-checksum-sctp: off
+rx-checksum: off
+
+Host side:   veth-dns  10.0.0.1/24
+Client side: veth-client (in namespace 'dnstest')  10.0.0.2/24
+
+To run the resolver:
+  sudo ./socket_resolver --local
+
+To send queries from the client namespace:
+  sudo ip netns exec dnstest dig @10.0.0.1 -p 53 google.com A
+  sudo ip netns exec dnstest dnsperf -s 10.0.0.1 -d payload.txt -l 10
+
+=== Done ===
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ./testbed.sh status
+=== Host interfaces ===
+veth-dns@if26    UP             10.0.0.1/24 fe80::54ae:daff:fedc:abeb/64 
+
+=== Namespace 'dnstest' ===
+veth-client@if27 UP             10.0.0.2/24 fe80::b5:66ff:feba:bd72/64 
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ip netns exec dnstest ping -c1 10.0.0.1
+PING 10.0.0.1 (10.0.0.1) 56(84) bytes of data.
+64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=0.043 ms
+
+--- 10.0.0.1 ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 0.043/0.043/0.043/0.000 ms
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ./socket_resolver_asan --local
+socket_resolver listening on port 53 (LOCAL MODE)
+^C
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ./socket_resolver_asan --local
+socket_resolver listening on port 53 (LOCAL MODE)
+
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ip netns exec dnstest dig @10.0.0.1 github.com A +short         # expect 140.82.121.3
+[sudo] password for divisht: 
+140.82.121.3
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ip netns exec dnstest dig @10.0.0.1 nothere.com A | grep status  # expect NXDOMAIN
+;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 19958
+
+Everything passed:
+
+- **Testbed:** veth pair up, and ping across it takes 0.043 ms.
+- **Port 53:** the resolver bound without trouble, so systemd-resolved needs no changes.
+- **Local mode:** `github.com` returns `140.82.121.3` and `nothere.com` returns NXDOMAIN, both matching the expected results.
+
+The `ethtool -L failed` note is harmless; veth already has a single queue.
+
+Two more steps finish the gating checks.
+
+**Step 1: malformed-packet test.** Leave the resolver running in terminal 1, and in terminal 2 run:
+
+```bash
+sed 's/5353/53/' malformed.py > malformed53.py
+sudo ip netns exec dnstest sed -i 's/127.0.0.1/10.0.0.1/' malformed53.py 2>/dev/null || sed -i 's/127.0.0.1/10.0.0.1/' malformed53.py
+sudo ip netns exec dnstest python3 malformed53.py
+```
+
+You should see 7 lines saying `no response (dropped)`, then `valid control query: got 54 bytes back`. Terminal 1 should show no `AddressSanitizer` lines.
+
+**Step 2: AF_XDP receive check.** This is the important one. First stop the resolver with Ctrl-C, because the XDP program takes port-53 traffic away from it. Then:
+
+```bash
+# Only if not done yet: packages + patch + build
+sudo apt install -y libbpf-dev libxdp-dev xdp-tools clang llvm
+patch -p1 --dry-run < setup-fixes.patch && patch -p1 < setup-fixes.patch
+clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c xdp_kern.c -o xdp_kern.o
+gcc -O2 -Wall -Wextra -o xsk_rx_test xsk_rx_test.c -lxdp -lbpf
+
+# Terminal 1
+sudo ./xsk_rx_test veth-dns
+```
+
+```bash
+# Terminal 2
+ip -d link show veth-dns | grep -o 'xdp[a-z]*'                               # note the mode: xdp = native, xdpgeneric = generic
+sudo ip netns exec dnstest dig @10.0.0.1 +tries=1 +time=1 google.com A       # will time out (RX only): expected
+sudo ip netns exec dnstest dig @10.0.0.1 -p 5300 +tries=1 +time=1 x.com      # must NOT appear in terminal 1
+```
+
+Terminal 1 should print exactly one packet, `UDP <port> -> 53`. Then press Ctrl-C there and check that `ip link show veth-dns` no longer shows `xdp`.
+
+Paste what terminal 1 prints, along with the mode from the `grep`. If it shows the single port-53 packet, the whole packet path is confirmed and `afxdp_resolver.c` can be written.
+
+ip -d link show veth-dns | grep -o 'xdp[a-z]*'                               # note the mode: xdp = native, xdpgeneric = generic
+xdp
+xdp
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ip netns exec dnstest dig @10.0.0.1 +tries=1 +time=1 google.com A       # will time out (RX only): expected
+;; communications error to 10.0.0.1#53: timed out
+
+; <<>> DiG 9.18.39-0ubuntu0.24.04.9-Ubuntu <<>> @10.0.0.1 +tries=1 +time=1 google.com A
+; (1 server found)
+;; global options: +cmd
+;; no servers could be reached
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ip netns exec dnstest dig @10.0.0.1 -p 5300 +tries=1 +time=1 x.com      # must NOT appear in terminal 1
+;; communications error to 10.0.0.1#5300: connection refused
+
+; <<>> DiG 9.18.39-0ubuntu0.24.04.9-Ubuntu <<>> @10.0.0.1 -p 5300 +tries=1 +time=1 x.com
+; (1 server found)
+;; global options: +cmd
+;; no servers could be reached
+
+Terminal 2's output is what we wanted:
+
+- **Mode is `xdp`**, meaning native on veth, not generic. Record that against config B in your benchmark table.
+- **Port 53 timed out.** That fits the packet being redirected into the AF_XDP socket. The test tool only receives and never replies, so nothing comes back.
+- **Port 5300 got `connection refused`**, which is positive evidence that the filter works. The packet went through `XDP_PASS` to the normal kernel stack, which found nothing on port 5300 and sent back ICMP port-unreachable. Had the XDP program redirected it as well, you'd have seen a timeout instead.
+
+The one missing piece is terminal 1, where `xsk_rx_test` is running. It should show exactly one packet, something like:
+
+```
+xsk_rx_test: listening on veth-dns (Ctrl-C to stop)
+[1] ETH xx:xx:.. -> xx:xx:.. proto=0x0800 len=93
+     IP  10.0.0.2 -> 10.0.0.1 proto=17 tot_len=79
+     UDP 4xxxx -> 53 len=59
+```
+
+Then press Ctrl-C there. It should print `Received 1 packets total`, and this should print nothing:
+
+```bash
+ip -d link show veth-dns | grep -o 'xdp[a-z]*'
+```
+
+Paste terminal 1's output. If it shows that one port-53 packet, the full receive path is confirmed (veth → XDP hook → XSKMAP → UMEM → user space), and you can start `afxdp_resolver.c`.
+
+divisht@divisht-Latitude-5420:~/AF_XDP-DNS-Resolver$ sudo ./xsk_rx_test veth-dns
+xsk_rx_test: listening on veth-dns (Ctrl-C to stop)
+[1] ETH 02:b5:66:ba:bd:72 -> 56:ae:da:dc:ab:eb proto=0x0800 len=93
+     IP  10.0.0.2 -> 10.0.0.1 proto=17 tot_len=79
+     UDP 53196 -> 53 len=59
+     
+     The receive path is confirmed. The frame's addresses match your testbed exactly:
+
+- **Source MAC `02:b5:66:ba:bd:72`** is `veth-client`; its link-local address `fe80::b5:66ff:feba:bd72` encodes the same MAC.
+- **Destination MAC `56:ae:da:dc:ab:eb`** is `veth-dns`, matching `fe80::54ae:daff:fedc:abeb`.
+- **IP and UDP** are `10.0.0.2 → 10.0.0.1`, UDP to port 53, 59 bytes. That's a 51-byte DNS query plus the 8-byte UDP header.
+- **Exactly one packet arrived.** The port-5300 query never reached the socket, so the filter works.
+
+That covers every stage of the receive chain: veth → native XDP hook → `xsk_rx_test` port check → XSKMAP[0] → UMEM frame → RX ring → user space.
+
+To close out, press Ctrl-C in terminal 1. It should print `Received 1 packets total`. Then confirm the program detached; this should print nothing:
+
+```bash
+ip -d link show veth-dns | grep -o 'xdp[a-z]*'
+```
+
+If anything is still attached, remove it with `sudo ip link set veth-dns xdp off`.
+
+All three gating steps now pass, so you can write `afxdp_resolver.c`. The parts that receive frames (UMEM, FILL/RX rings, XDP attach) already work in `xsk_rx_test.c` and can be reused. What's new is:
+
+1. Parsing the DNS payload out of the frame and handing it to `dns_validate_query()` and `dns_local_lookup()` from `dns.c`.
+2. Building the reply in the same frame: swap the MAC and IP addresses and the UDP ports, fix the length fields, and recompute the IPv4 checksum. The UDP checksum can be 0.
+3. Sending it through the TX ring, then recycling frames from the COMP ring back to FILL.
+4. Fixing the open bug in `xsk_rx_test`'s recycle loop: copy each descriptor address *before* calling `xsk_ring_cons__release()`.
+5. Adding a flag to force `XDP_FLAGS_SKB_MODE` or `XDP_FLAGS_DRV_MODE`, so you can run benchmark configs A, B and C.
+
+Build `--local` mode first. Once it answers `dig` correctly, it can go straight into the dnsperf comparison against `socket_resolver --local`. Recursive mode can come after that, with the upstream leg kept on a normal UDP socket.
+
+The setup work is finished: packages, patch, build, testbed, local resolver and the AF_XDP receive check all pass. Everything left is new work, in this order:
+
+## Step 1: Write `afxdp_resolver.c` with `--local` mode only
+
+Start from a copy of `xsk_rx_test.c`, since the receive side already works:
+
+```bash
+cp xsk_rx_test.c afxdp_resolver.c
+```
+
+Then add these pieces, testing each before writing the next:
+
+| # | What to add | How to check it |
+|---|---|---|
+| 1a | Arguments: `--local <iface> [--skb|--drv]`, so the XDP mode is set explicitly | `ip -d link` shows `xdpgeneric` or `xdp` to match the flag |
+| 1b | For each RX frame: find the UDP payload at `eth + ihl*4 + 8` and call `dns_validate_query()` | Print the qname; `dig github.com` should print `github.com` |
+| 1c | Build the reply **in the same frame**: swap MACs, IPs and ports; write the DNS answer from `dns_local_lookup()` + `dns_build_response()` after the UDP header; set `ip->tot_len`, `udp->len` and `desc.len`; recompute the IPv4 checksum; set `udp->check = 0` | `tcpdump` in the client namespace shows a valid reply |
+| 1d | Send: put the frame on the TX ring, kick with `sendto(fd, NULL, 0, MSG_DONTWAIT, NULL, 0)`, read the COMP ring and return those frames to FILL | `dig` gets an answer |
+| 1e | Frame accounting: copy RX descriptor addresses *before* release; don't hand frames back to FILL while they're on TX | 100,000 queries with no stall |
+
+Build it:
+
+```bash
+gcc -O2 -Wall -Wextra -o afxdp_resolver afxdp_resolver.c dns.c -lxdp -lbpf
+gcc -g -O1 -fsanitize=address,undefined -o afxdp_resolver_asan afxdp_resolver.c dns.c -lxdp -lbpf
+```
+
+## Step 2: Test it the same way as the socket resolver
+
+```bash
+sudo ./afxdp_resolver_asan --local veth-dns --drv                            # terminal 1
+sudo ip netns exec dnstest dig @10.0.0.1 github.com A +short                 # 140.82.121.3
+sudo ip netns exec dnstest dig @10.0.0.1 nothere.com A | grep status         # NXDOMAIN
+sudo ip netns exec dnstest dig @10.0.0.1 google.com TXT | grep status        # NOTIMP
+sudo ip netns exec dnstest python3 malformed53.py                            # 7 dropped, 1 answered
+sudo ip netns exec dnstest tcpdump -vni veth-client udp port 53 -c 2        # look for "bad udp cksum" / "bad hdr cksum"
+```
+
+It passes when the answers are identical to `socket_resolver --local`, with no checksum errors and no ASan output.
+
+## Step 3: Benchmark on veth (configs A and B)
+
+```bash
+sudo apt install -y dnsperf sysstat
+# Pin the resolver to one core so both arms are comparable
+sudo taskset -c 2 ./socket_resolver --local                          # baseline
+sudo taskset -c 2 ./afxdp_resolver --local veth-dns --skb            # config A
+sudo taskset -c 2 ./afxdp_resolver --local veth-dns --drv            # config B
+
+# For each one, from another terminal, 3 runs:
+for r in 1 2 3; do sudo ip netns exec dnstest dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 500000 | grep -E 'Queries per second|Average Latency|lost'; done
+pidstat -u -p $(pgrep -f '_resolver') 1 30                           # CPU during a run
+```
+
+Record QPS, average latency, lost queries and CPU %, as mean ± s.d.
+
+## Step 4: Real NIC (config C) on `enp0s31f6`
+
+You need a second machine connected by Ethernet cable.
+
+```bash
+# Laptop (resolver)
+sudo ip addr add 192.168.50.1/24 dev enp0s31f6 && sudo ip link set enp0s31f6 up
+sudo ethtool -K enp0s31f6 gro off
+sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb
+# Other machine (client)
+sudo ip addr add 192.168.50.2/24 dev <its-eth> 
+dnsperf -s 192.168.50.1 -d payload.txt -l 30 -c 8 -Q 500000
+```
+
+Then repeat with `socket_resolver --local` on the same link. Record the exact NIC model with `lspci | grep -i ethernet`.
+
+## Step 5: Recursive mode (optional, after the benchmarks)
+
+1. Fix the three resolver bugs in `socket_resolver.c`/`dns.c` (guide §9: CNAME, NODATA, rdlength) and re-run the mock-hierarchy table in §6.2 until every row is correct.
+2. Add recursion to `afxdp_resolver`. Client traffic stays on XSK; the upstream hops to root, TLD and authoritative servers stay on a normal UDP socket. Use `epoll` or `poll` over both the XSK fd and the UDP fd.
+
+## Step 6: Write the report
+
+Include:
+- a results table for baseline / A / B / C;
+- a mode-and-hardware table: interface, driver, `xdp` vs `xdpgeneric`, and copy mode throughout;
+- an explanation of why generic mode helps little (SKB allocation still happens), what native copy mode saves, and what zero-copy on `i40e`/`ice` would add;
+- the limitations: single queue, IPv4 only, no EDNS/TCP.
+
+Step 1 is where the real effort goes, and parts 1c–1d (checksums and the TX/COMP rings) are where most AF_XDP code breaks. I can write `afxdp_resolver.c` for you to review line by line, or a skeleton with the hard parts commented so you write the bodies yourself. Which do you want?
+
+what exactly is af_xdp_Resolver.c here
+
+`afxdp_resolver.c` is the second half of your experiment, and the half that doesn't exist yet. It's a DNS resolver that does exactly the same DNS work as `socket_resolver.c`, but sends and receives its packets through AF_XDP instead of normal UDP sockets.
+
+Your project compares two ways of moving the same packets:
+
+| | `socket_resolver.c` (exists) | `afxdp_resolver.c` (to write) |
+|---|---|---|
+| DNS logic | `dns.c` | **the same** `dns.c` |
+| How a query arrives | NIC → kernel builds an SKB → IP → UDP → socket lookup → `recvfrom()` copies the payload to you | NIC → XDP program → XSKMAP → the frame lands in your UMEM → you read it off the RX ring |
+| What you receive | Just the DNS payload | The whole Ethernet frame (Eth + IP + UDP + DNS) |
+| How the reply leaves | `sendto()`, and the kernel builds the UDP, IP and Ethernet headers | **You** write every header yourself, put the frame on the TX ring, and kick the kernel |
+| Who does checksums, lengths, MACs | The kernel | You |
+
+Because the DNS code is identical, any difference in queries per second, latency or CPU use comes from the packet I/O path alone. That's the whole point of the comparison, and it's why `dns.c` was split out as a shared file.
+
+**How it relates to `xsk_rx_test.c`.** `xsk_rx_test.c` is roughly the first half of `afxdp_resolver.c`: set up the UMEM, create the XSK socket, attach `xdp_kern.o`, receive frames, print them. `afxdp_resolver.c` keeps all of that and adds:
+
+1. **Understanding the frame.** Skip the Ethernet, IP and UDP headers to reach the DNS query, then call `dns_validate_query()`.
+2. **Producing an answer.** Call `dns_local_lookup()` and `dns_build_response()`, the same calls `socket_resolver` makes.
+3. **Turning the frame into a reply.** In the same UMEM frame, swap source and destination MACs, IPs and ports, write the DNS answer, fix the IP and UDP length fields, and recompute the IP checksum.
+4. **Transmitting.** Put the frame on the TX ring, wake the kernel, then take finished frames back from the COMPLETION ring and return them to FILL so they can receive again.
+
+In short: `xsk_rx_test` proves packets reach you, and `afxdp_resolver` answers them.
+
+**What you'll measure.** Run both binaries on the same testbed with the same dnsperf load. `afxdp_resolver` should spend less CPU per query, because it skips SKB allocation, the UDP/IP stack, socket lookup and one copy per packet. How much it saves depends on the XDP mode (native on veth, generic on `e1000e`), which is exactly what your configurations A, B and C are set up to show.
+
+is it using af_xdp instead of the linux networking stack for dns queries
+
+Yes, for client DNS queries on port 53 arriving at the interface the XDP program is attached to, in both directions. There are a few qualifications worth knowing for the report and the viva.
+
+**What bypasses the stack:**
+- **Incoming queries.** The XDP program runs in the NIC driver, before the IP stack, and redirects UDP port-53 packets straight to your AF_XDP socket. They never go through IP routing, netfilter/iptables, conntrack, UDP socket lookup or `recvfrom()`.
+- **Outgoing replies.** You write the complete Ethernet frame yourself and put it on the TX ring. It skips the UDP and IP layers, routing, neighbour (ARP) lookup and netfilter.
+
+**What still uses the normal stack:**
+- **Everything that isn't UDP to port 53.** ARP, ping, SSH and so on get `XDP_PASS` and go through the kernel as usual. That's why ARP still works on the testbed, and your resolver relies on it: the client has to learn your MAC before it can send a query.
+- **The upstream leg in recursive mode.** In the planned design, queries to root, TLD and authoritative servers use a normal UDP socket. Only the client-facing side uses AF_XDP.
+
+**How much it bypasses depends on the mode:**
+
+| Mode | RX path | TX path |
+|---|---|---|
+| **Native, zero-copy** (i40e, ice, mlx5…) | NIC DMAs straight into UMEM. No SKB, no copy. | Driver sends straight from UMEM |
+| **Native, copy** (veth: your config B) | XDP runs in the driver before any SKB, then one copy into UMEM | Kernel allocates an SKB and sends it directly to the driver (`dev_direct_xmit`), skipping IP and qdisc |
+| **Generic** (`e1000e`: configs A and C) | Driver **already built an SKB**; XDP runs after that, then copies into UMEM | Same SKB-based send path |
+
+So in generic mode, the expensive first step (allocating the SKB) has already happened before XDP sees the packet. You still skip the IP, UDP and socket layers, but the saving is much smaller. That's the main reason to expect config C to show only a modest gain over sockets.
+
+**Side effects of bypassing the stack:**
+- **No firewall.** iptables/nftables rules never see these packets.
+- **tcpdump on that interface won't show them.** Capture on the client side, or use `xdpdump`.
+- **You own all correctness.** Checksums, length fields, MAC addresses and malformed-packet handling are no longer done by the kernel, so your code has to get them right.
+
+All three belong in the report's discussion of trade-offs. "Faster but you lose the stack's services" is exactly the trade-off your project description refers to.
+
+no after the routing to the dns resolver - when it recurses the resolution to tld and all these , it shouldn't use af_xdp
+
+Yes, that's the right design, and it's what the plan assumes. Only the client-facing side uses AF_XDP. Recursion to root, TLD and authoritative servers goes through an ordinary UDP socket and the normal Linux stack.
+
+```
+client ──query──► [XDP: UDP dst 53] ─► AF_XDP socket ─► resolver ─┐
+client ◄──reply── TX ring ◄──────────────────────────── resolver  │
+                                                                  │ normal UDP socket
+                                       root / TLD / authoritative ◄┘ (kernel stack both ways)
+```
+
+**Why upstream replies don't get pulled into AF_XDP.** `xdp_kern.c` redirects only on **destination port 53**:
+
+- When your resolver queries a root server, the packet leaves from an ephemeral source port such as `41705`, going to port 53. It is outbound, and XDP only sees incoming traffic.
+- The root server's reply comes back from port 53 *to* port 41705. Its destination port isn't 53, so the program returns `XDP_PASS` and the kernel delivers it to your UDP socket as usual.
+
+This holds even when upstream traffic uses the same NIC that has XDP attached. On your laptop it doesn't anyway: XDP sits on `veth-dns` (or later `enp0s31f6`), while upstream traffic leaves through the default route on Wi-Fi, which has no XDP program.
+
+There's one rule to keep in the code: **never bind the upstream socket to source port 53.** If you did, the replies would arrive with destination port 53 and XDP would redirect them into the XSK, where the resolver isn't expecting them. `socket_resolver.c` already gets this right, because it never binds `upstream_fd`.
+
+**What this changes in `afxdp_resolver.c`.** Compared with `socket_resolver.c`, three things differ in recursive mode:
+
+1. **Two file descriptors in one event loop.** `poll()` or `epoll()` watches the XSK fd for client queries and the UDP fd for upstream replies. `check_timeouts()` stays as it is.
+2. **More client state per pending query.** `socket_resolver` stores only `client_addr`, because `sendto()` handles the rest. The AF_XDP reply is sent later, after the recursion finishes, and you build the whole frame yourself. So each pending query must save the **client MAC, your MAC, client IP, your IP, and both UDP ports**, along with the client's transaction ID. Copy those 42 bytes of headers into the pending struct; don't keep the original UMEM frame around. Holding frames for up to 5 seconds of recursion would drain the FILL ring.
+3. **The final reply goes out through TX.** When `handle_ns_response()` has an answer, build Eth + IP + UDP + DNS into a free UMEM frame and put it on the TX ring, instead of calling `sendto(client_fd, …)`.
+
+Everything else — the cache, referral following, CNAME handling, timeouts and the upstream parsing in `dns.c` — carries over unchanged, since the upstream side is plain sockets in both resolvers.
+
+**For the report:** in recursive mode, both resolvers do the upstream leg identically, and its latency (tens of milliseconds) swamps the client-side difference (microseconds). Use `--local` for the headline AF_XDP vs. sockets numbers, and present recursive mode as a functional check that the design works end to end.
+
+doesn't recursive_resolver.c do the job?
+
+No. `recursive_resolver.c` does the DNS side of the job, iterative resolution from the root, but **it doesn't use AF_XDP at all**. It's an all-sockets resolver:
+
+```c
+int client_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);  // clients: normal UDP socket, port 5353
+upstream_fd   = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, IPPROTO_UDP);  // upstream: normal UDP socket
+...
+recvfrom(client_fd, ...);   sendto(client_fd, ...);                        // kernel stack both ways
+```
+
+It has no UMEM, no XSK socket, no rings and no XDP program, so client queries go through the full Linux stack exactly as they do in `socket_resolver.c`.
+
+It's essentially an **older copy of `socket_resolver.c`**, written before the DNS code was split out into `dns.c`:
+
+| | `recursive_resolver.c` | `socket_resolver.c` |
+|---|---|---|
+| Iterative recursion, cache, CNAME, timeouts | yes | yes (same logic) |
+| DNS code | its own internal copy | shared `dns.c` |
+| Port | 5353 | 53 |
+| Client side | UDP socket | UDP socket |
+| Role in the project | superseded | **baseline arm** |
+
+Both have the same bugs (CNAME question mismatch, NODATA → SERVFAIL), since one was copied from the other.
+
+What the experiment needs:
+
+| Resolver | Client-facing side | Upstream (root/TLD/auth) | Exists? |
+|---|---|---|---|
+| Baseline | UDP socket | UDP socket | yes: `socket_resolver.c` |
+| Test arm | **AF_XDP** | UDP socket | **no: `afxdp_resolver.c`** |
+
+`afxdp_resolver.c` takes the recursion logic you already have and replaces only the client-facing `recvfrom`/`sendto` with the XSK RX and TX rings. The recursion engine itself (cache, `handle_ns_response`, timeouts) is copied over almost unchanged. So `recursive_resolver.c` and `socket_resolver.c` both supply the recursion that `afxdp_resolver.c` will reuse; neither one is the AF_XDP part.
+
+When you build it, start from `socket_resolver.c` rather than `recursive_resolver.c`. It uses the shared `dns.c`, so both arms run identical DNS code, which is what makes the comparison fair. I'd also delete `recursive_resolver.c` or move it to an `old/` folder, so nobody benchmarks the wrong binary by mistake.
+
+we are thinking of keeping the project clean and removing some files ( older versions and stuff) , what do you suggest
+
+Here's how I'd sort each file. The test is whether it belongs to the final experiment (two resolvers sharing `dns.c`, plus the tools that test them).
+
+**Keep** (the core of the project):
+
+| File | Why |
+|---|---|
+| `dns.c`, `dns.h` | Shared DNS logic for both resolvers |
+| `socket_resolver.c` | Baseline arm |
+| `xdp_kern.c` | XDP program, required by AF_XDP |
+| `afxdp_resolver.c` | Test arm (when written) |
+| `xsk_rx_test.c` | Minimal "is AF_XDP receiving?" check. Worth keeping for debugging and for demonstrating the receive path in the viva |
+| `testbed.sh` | Test network |
+| `payload.txt` | dnsperf input. It has only 8 names, all in the local zone, which is what `--local` benchmarking needs |
+| `malformed.py` | Robustness test. Update it to target `10.0.0.1:53`, or take the address as an argument, instead of the hard-coded `127.0.0.1:5353` |
+
+**Add** (from this session):
+
+| File | Why |
+|---|---|
+| `TESTING_UBUNTU.md` | The setup guide |
+| `mock_dns.py` | Repeatable recursion tests without the Internet |
+| A `Makefile` | One command builds everything, with the right flags and the BPF include path |
+
+**Remove:**
+
+| File | Why |
+|---|---|
+| `recursive_resolver.c` | Older single-file version of `socket_resolver.c`; same logic, its own copy of the DNS code, port 5353 |
+| `udp_dns_resolver.c` | Forwarder to 8.8.8.8, from the project's first phase. Not part of the recursive design |
+| `spoof.py` | Written for the forwarder's 8.8.8.8 source check. It doesn't exercise `socket_resolver`'s check without changes |
+| `setup-fixes.patch` | Already applied; committing it would only confuse people |
+| `malformed53.py`, compiled binaries, `*.o` | Generated files, so they belong in `.gitignore` |
+
+**Rewrite:** `README.md`. All of it currently describes `udp_dns_resolver.c` as `resolver.c` on port 5353, including results from the forwarder. Replace it with a short project overview, build steps and a link to the testing guide. Keep the old forwarder numbers only if you plan to mention that phase in the report.
+
+**Before deleting anything, tag the current state** so the old versions stay retrievable:
+
+```bash
+git tag pre-cleanup && git push origin pre-cleanup
+git rm recursive_resolver.c udp_dns_resolver.c spoof.py
+rm -f setup-fixes.patch malformed53.py
+```
+
+The forwarder and its README results then stay in git history if the report needs to cite them, for example as the "phase 1 forwarder baseline".
+
+Suggested `.gitignore` additions:
+
+```
+socket_resolver
+socket_resolver_asan
+afxdp_resolver
+afxdp_resolver_asan
+xsk_rx_test
+malformed53.py
+*.o
+```
+
+**Folder layout:** with about 10 files, keeping everything at the top level is fine and keeps the guide's commands valid. Only if the repo grows would I move to `src/`, `tools/`, `tests/` and `docs/`, and then the paths in the guide would need updating too.
+
+I can write the Makefile, a new README and an updated `malformed.py` if you'd like them.
+
+any more changes?
+
+
+
+I'll unpack the new version, diff it against the one you sent before, and rebuild and retest it.
+
+The patch is applied as intended. The new item is `afxdp_resolver.c`, so I'll read it in full.
+
+It held up: 2.9 M queries, 0 lost, still answering afterwards, and it detached cleanly. But the sanitiser reported 11 problems, so I'm checking what they are:
+
+The new `afxdp_resolver.c` works, and works well. I built it, ran it on the veth testbed and put it under sustained load.
+
+**Test results:**
+- **Correct answers:** they match `socket_resolver --local` exactly (NOERROR, NXDOMAIN, NOTIMP).
+- **Valid packets:** tcpdump on the client side shows a correct IP checksum and `no cksum` for UDP, which is legal on IPv4.
+- **Malformed input:** all 7 bad packets are dropped and the control query is answered.
+- **No leaks or stalls:** about 9 M queries per run with 0 lost, RX = TX exactly, it still answers afterwards, and it detaches cleanly on Ctrl-C.
+- **First benchmark** (my sandbox: 2 CPUs shared with dnsperf, 3 runs each):
+
+| Resolver | XDP mode | QPS | Avg latency |
+|---|---|---|---|
+| `socket_resolver` | none | ~172k | ~415 µs |
+| `afxdp_resolver` | generic (`xdpgeneric`) | ~376k | ~107 µs |
+| `afxdp_resolver` | native (`xdp`) | ~356k | ~112 µs |
+
+AF_XDP is roughly **2.2× the throughput at a quarter of the latency**. Generic and native came out about equal on veth. My understanding of why: veth packets start life as SKBs created by the sender's stack, so native mode on veth doesn't avoid SKB allocation the way it does on real hardware. That's worth a paragraph in the report. Your laptop's numbers will differ, so treat these as a sanity check, not results.
+
+**Changes to `afxdp_resolver.c`:**
+1. **The mode label is wrong.** The comment and the startup message say "generic XDP", but `bpf_xdp_attach(…, 0, …)` gave **native** on veth, as I confirmed here. Add the `--skb`/`--drv` flag for configs A, B and C. That needs `#include <linux/if_link.h>`, and the detach call must use the same flag.
+2. **Handle SIGTERM as well as SIGINT.** Otherwise `kill` or `timeout` leaves the XDP program attached and the next run fails. One line: `signal(SIGTERM, sigint_handler);`.
+3. **Small bounds gap.** `udp->dest` is read before checking that the frame is long enough when the IP header has options (`ihl > 5`). Add `if (udp_data_off > (int)rx_len) continue;` before touching `udp`. It can't crash, because the frame is 4096 bytes, but it should be checked.
+4. **Build notes.** The header comment's `clang` line needs `-I/usr/include/$(uname -m)-linux-gnu`. ASan builds need `-fno-sanitize=alignment`: UBSan flags the IP header at byte 14 as misaligned, which is normal for packet code and harmless on x86.
+
+**Repo cleanup**, compared with what we discussed:
+- **`malformed.py` was deleted.** Put it back; it's your robustness test, and I used it on the new resolver just now.
+- **`.gitignore` was deleted.** Restore it with the binary names added, or compiled binaries will end up in git.
+- **`README.md` was deleted** and nothing replaced it. The repo needs at least a short overview and build steps.
+- **`setup-fixes.patch` is committed.** Delete it; it's already applied.
+- **`recursive_resolver.c` is still there.** Delete it, since it's superseded by `socket_resolver.c`.
+- **`TESTING_UBUNTU.md` and `mock_dns.py` haven't been added.** Add them if you want the guide and the offline recursion test in the repo.
+
+Once items 1–3 are fixed, run the full A/B/C benchmark on the laptop. If you'd like, I can write the Makefile, a new README and the `.gitignore`, sized to the current file set.
+
+the environment is all set up, i suppose we have all the files and would be able to benchmark and stuff - give me discrete steps one by one - no doc just steps
+
+
+
+Here are the steps in order. Finish each one before starting the next.
+
+**Step 1: Make the three code fixes in `afxdp_resolver.c`.**
+
+```c
+// (a) after  #include <linux/udp.h>
+#include <linux/if_link.h>
+
+// (b) at the top of main(), next to  int local_mode = 0;
+__u32 xdp_mode = 0;
+
+// (c) in the argument loop, before the final  else ifname = argv[i];
+else if (strcmp(argv[i], "--skb") == 0) xdp_mode = XDP_FLAGS_SKB_MODE;
+else if (strcmp(argv[i], "--drv") == 0) xdp_mode = XDP_FLAGS_DRV_MODE;
+
+// (d) replace the attach and detach calls
+ret = bpf_xdp_attach(ifindex, prog_fd, xdp_mode, NULL);
+bpf_xdp_detach(ifindex, xdp_mode, NULL);
+
+// (e) after  signal(SIGINT, sigint_handler);
+signal(SIGTERM, sigint_handler);
+
+// (f) right after  int udp_data_len = ...;
+if (udp_data_off > (int)rx_len) continue;
+```
+
+**Step 2: Build.**
+
+```bash
+cd ~/AF_XDP-DNS-Resolver
+clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c xdp_kern.c -o xdp_kern.o
+gcc -O3 -Wall -Wextra -o socket_resolver socket_resolver.c dns.c
+gcc -O3 -Wall -Wextra -o afxdp_resolver afxdp_resolver.c dns.c -lxdp -lbpf
+```
+
+**Step 3: Prepare the machine.** Plug in AC power, close browsers and other heavy apps, then:
+
+```bash
+sudo apt install -y dnsperf sysstat linux-tools-common linux-tools-$(uname -r)
+sudo cpupower frequency-set -g performance
+nproc        # note the core count
+```
+
+**Step 4: Reset the testbed.**
+
+```bash
+sudo ./testbed.sh teardown
+sudo ./testbed.sh setup
+sudo ip netns exec dnstest ping -c1 10.0.0.1
+```
+
+**Step 5: Check that the AF_XDP resolver answers correctly in each mode.** Terminal 1:
+
+```bash
+sudo ./afxdp_resolver --local veth-dns --skb
+```
+
+Terminal 2:
+
+```bash
+ip -d link show veth-dns | grep -o 'xdp[a-z]*'                   # expect xdpgeneric
+sudo ip netns exec dnstest dig @10.0.0.1 github.com A +short     # expect 140.82.121.3
+```
+
+Press Ctrl-C in terminal 1 and repeat with `--drv`. The `grep` should now print `xdp`.
+
+**Step 6: Benchmark the baseline socket resolver.** Terminal 1:
+
+```bash
+sudo taskset -c 2 ./socket_resolver --local
+```
+
+Terminal 2:
+
+```bash
+for r in 1 2 3; do sudo ip netns exec dnstest taskset -c 4-7 dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 2000000 | grep -E 'Queries lost|per second|Average Latency'; done
+```
+
+Terminal 3, during one of the runs:
+
+```bash
+pidstat -u -p $(pgrep -x socket_resolver) 1 20
+```
+
+Write down QPS, average latency, lost queries and CPU %.
+
+**Step 7: Benchmark config A (veth, generic mode).** Stop the socket resolver, then in terminal 1:
+
+```bash
+sudo taskset -c 2 ./afxdp_resolver --local veth-dns --skb
+```
+
+Repeat step 6's terminal 2 and 3 commands, using `pgrep -x afxdp_resolver`. Record the same four numbers.
+
+**Step 8: Benchmark config B (veth, native mode).** Same as step 7, with `--drv`.
+
+**Step 9: Tear down the testbed.**
+
+```bash
+sudo ./testbed.sh teardown
+```
+
+**Step 10: Set up config C (real NIC).** This needs a second machine connected by Ethernet cable. On the laptop:
+
+```bash
+sudo ip addr add 192.168.50.1/24 dev enp0s31f6
+sudo ip link set enp0s31f6 up
+sudo ethtool -K enp0s31f6 gro off
+lspci | grep -i ethernet          # record the exact NIC model
+```
+
+On the other machine:
+
+```bash
+sudo ip addr add 192.168.50.2/24 dev <its-ethernet>
+ping -c1 192.168.50.1
+```
+
+**Step 11: Benchmark config C.** On the laptop, run each of these in turn:
+
+```bash
+sudo taskset -c 2 ./socket_resolver --local
+sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb
+```
+
+On the other machine, three runs per resolver:
+
+```bash
+dnsperf -s 192.168.50.1 -d payload.txt -l 30 -c 8 -Q 2000000
+```
+
+Record the same numbers. Also try `--drv` once; it should fail on `e1000e`, which confirms the driver has no native XDP.
+
+**Step 12: Clean up.**
+
+```bash
+sudo ip link set veth-dns xdp off 2>/dev/null
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+sudo ip addr del 192.168.50.1/24 dev enp0s31f6
+sudo cpupower frequency-set -g powersave
+```
+
+**Step 13: Put the results in one table.**
+
+| Config | Interface | Mode | QPS (mean ± s.d.) | Latency | CPU % | Lost |
+|---|---|---|---|---|---|---|
+| Baseline | veth | — | | | | |
+| A | veth | generic | | | | |
+| B | veth | native | | | | |
+| Baseline | `enp0s31f6` | — | | | | |
+| C | `enp0s31f6` | generic | | | | |
+
+If any step gives an unexpected result, paste the output.
+
+
+
+Step 1: Make the three code fixes in `afxdp_resolver.c`.
+c
+
+```c
+// (a) after  #include <linux/udp.h>
+#include <linux/if_link.h>
+
+// (b) at the top of main(), next to  int local_mode = 0;
+__u32 xdp_mode = 0;
+
+// (c) in the argument loop, before the final  else ifname = argv[i];
+else if (strcmp(argv[i], "--skb") == 0) xdp_mode = XDP_FLAGS_SKB_MODE;
+else if (strcmp(argv[i], "--drv") == 0) xdp_mode = XDP_FLAGS_DRV_MODE;
+
+// (d) replace the attach and detach calls
+ret = bpf_xdp_attach(ifindex, prog_fd, xdp_mode, NULL);
+bpf_xdp_detach(ifindex, xdp_mode, NULL);
+
+// (e) after  signal(SIGINT, sigint_handler);
+signal(SIGTERM, sigint_handler);
+
+// (f) right after  int udp_data_len = ...;
+if (udp_data_off > (int)rx_len) continue;
+```
+
+
+
+You pasted the step back without a question, so I take it you want those edits made for you. I'll apply them to your file, check that it builds and runs, and send you the edited file.
+
+One correction to my own instructions first. I placed fix (f) too late: by the line I named, `udp->dest` has already been read. The bounds check has to come *before* the UDP header is touched, and I've put it there in the file.
+
+Step 1 is done; download `afxdp_resolver.c` and replace your copy with it. It compiles with no warnings, and I tested all three modes on the veth testbed:
+
+| Flag | Mode it attached in | `dig github.com` | After `kill`, XDP still attached? |
+|---|---|---|---|
+| `--skb` | `xdpgeneric` | 140.82.121.3 | no |
+| `--drv` | `xdp` | 140.82.121.3 | no |
+| (none) | `xdp` (kernel's choice) | 140.82.121.3 | no |
+
+The startup line now prints the mode, for example `XDP mode: generic (forced)`, so every benchmark log records which configuration it came from.
+
+Besides moving the bounds check, I made two small additions you didn't ask for. The usage message now lists `[--skb|--drv]`, and the startup message prints the real mode instead of the hard-coded "generic XDP".
+
+Next, step 2:
+
+```bash
+cd ~/AF_XDP-DNS-Resolver
+cp ~/Downloads/afxdp_resolver.c .        # or wherever the download landed
+gcc -O3 -Wall -Wextra -o afxdp_resolver afxdp_resolver.c dns.c -lxdp -lbpf
+```
+
+
+
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ ip -d link show veth-dns | grep -o 'xdp[a-z]*'                   # expect xdpgeneric
+xdpgeneric
+xdp
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ip netns exec dnstest dig @10.0.0.1 github.com A +short     # expect 140.82.121.3
+[sudo] password for divisht: 
+140.82.121.3
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ip netns exec dnstest dig @10.0.0.1 github.com A +short     # expect 140.82.121.3
+140.82.121.3
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ ip -d link show veth-dns | grep -o 'xdp[a-z]*'                   # expect xdpgeneric
+xdp
+xdp
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ for r in 1 2 3; do sudo ip netns exec dnstest taskset -c 4-7 dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 2000000 | grep -E 'Queries lost|per second|Average Latency'; done
+  Queries lost:         0 (0.00%)
+  Queries per second:   246961.256299
+  Average Latency (s):  0.000383 (min 0.000005, max 0.003043)
+  Queries lost:         0 (0.00%)
+  Queries per second:   206510.740352
+  Average Latency (s):  0.000476 (min 0.000007, max 0.000930)
+  Queries lost:         0 (0.00%)
+  Queries per second:   204037.236077
+  Average Latency (s):  0.000482 (min 0.000006, max 0.000854)
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ for r in 1 2 3; do sudo ip netns exec dnstest taskset -c 4-7 dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 2000000 | grep -E 'Queries lost|per second|Average Latency'; done
+  Queries lost:         0 (0.00%)
+  Queries per second:   415916.243092
+  Average Latency (s):  0.000033 (min 0.000003, max 0.003818)
+  Queries lost:         0 (0.00%)
+  Queries per second:   379567.713622
+  Average Latency (s):  0.000050 (min 0.000003, max 0.003918)
+  Queries lost:         0 (0.00%)
+  Queries per second:   417246.634352
+  Average Latency (s):  0.000079 (min 0.000003, max 0.004431)
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ for r in 1 2 3; do sudo ip netns exec dnstest taskset -c 4-7 dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 2000000 | grep -E 'Queries lost|per second|Average Latency'; done
+  Queries lost:         0 (0.00%)
+  Queries per second:   528335.664599
+  Average Latency (s):  0.000095 (min 0.000003, max 0.001532)
+  Queries lost:         0 (0.00%)
+  Queries per second:   500672.496369
+  Average Latency (s):  0.000113 (min 0.000003, max 0.000450)
+  Queries lost:         0 (0.00%)
+  Queries per second:   379434.971978
+  Average Latency (s):  0.000020 (min 0.000003, max 0.004336)
+  
+  
+  
+  Baseline, A and B all ran. Here are the numbers:
+
+| Config | Mode | QPS (mean ± s.d.) | vs. socket | Avg latency | Run-to-run variation |
+|---|---|---|---|---|---|
+| Socket baseline | none | 219.2k ± 24.1k | 1.00× | 447 µs | 11% |
+| A (veth) | generic (`xdpgeneric`) | 404.2k ± 21.4k | **1.84×** | 54 µs | 5% |
+| B (veth) | native (`xdp`) | 469.5k ± 79.2k | **2.14×** | 76 µs | 17% |
+
+Every run lost 0 queries, and RX matched TX exactly (36 M and 42 M packets). The resolver is solid.
+
+The socket resolver's CPU profile is already a report finding: **98.9% CPU, of which 90% is `%system`**. The baseline spends almost all its time inside the kernel's network stack, which is exactly the cost AF_XDP avoids.
+
+Before these become final numbers, four things need fixing:
+
+**1. CPU was never measured for A or B.** The second and third `pidstat` runs used `pgrep -x socket_resolver` while the socket resolver wasn't running. `pgrep` returned nothing, so `pidstat` ended up watching PID 1 (systemd). Rerun with the right name:
+
+```bash
+pidstat -u -p $(pgrep -x afxdp_resolver) 1 20
+```
+
+**2. Check that dnsperf isn't the bottleneck.** If `afxdp_resolver` sits well below 100% CPU in that `pidstat`, the load generator is the limit, and A and B are really lower bounds. Report them as such ("≥ 404k").
+
+**3. The resolver and dnsperf may be sharing a physical core.** 8 logical CPUs here means 4 cores with 2 threads each. Check which CPUs pair up:
+
+```bash
+lscpu -e=CPU,CORE
+```
+
+If CPU 2 and CPU 6 share a core, then `taskset -c 4-7` puts dnsperf on the resolver's other hyperthread. Choose dnsperf CPUs that exclude both threads of the resolver's core. For example, if pairs are 0/4, 1/5, 2/6, 3/7, use resolver on `2` and dnsperf on `0,1,3,4,5,7`.
+
+**4. B's variation (17%) is too high, and latency at full load mostly measures queueing.** Run B's third run (379k at 20 µs) looks like thermal throttling or interference. Fix both by:
+- doing 5 runs per config, waiting 30 s between runs, and reporting the median;
+- measuring latency separately at a fixed load that all three can sustain, for example 150k QPS:
+
+```bash
+for r in 1 2 3 4 5; do sudo ip netns exec dnstest taskset -c <dnsperf-cpus> dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 2000000 | grep -E 'per second|lost'; sleep 30; done      # throughput
+for r in 1 2 3; do sudo ip netns exec dnstest taskset -c <dnsperf-cpus> dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 150000 | grep -E 'Average Latency|lost'; sleep 30; done  # latency at equal load
+```
+
+So the report gets two tables: maximum throughput, and latency at equal load. For each config, follow this order:
+1. Run `lscpu -e=CPU,CORE` once and choose the CPUs.
+2. Start the resolver.
+3. Run the throughput loop, with `pidstat` in a third terminal.
+4. Run the latency loop.
+
+**Config C:** the laptop side is ready. `enp0s31f6` is a confirmed **Intel I219-LM (rev 20)**, configured as `192.168.50.1`. The next step needs the second machine on the cable.
+
+
+give me steps for each of the runs - to get the cpu values and all the data that was missing in my runs
+Below is the full sequence for the three veth configurations. Each run now saves throughput, latency, lost queries and CPU to files automatically, so nothing has to be watched or copied by hand.
+
+**Step 1: One-time setup** (terminal 2):
+
+```bash
+cd ~/AF-XDP_DNS-Resolver
+sudo cpupower frequency-set -g performance      # and keep the laptop on AC power
+sudo ./testbed.sh teardown; sudo ./testbed.sh setup
+mkdir -p results
+sudo -v                                          # cache the sudo password for the runs
+```
+
+**Step 2: Choose the CPUs** (terminal 2). The resolver gets CPU 2, and dnsperf gets every CPU that isn't on the same physical core:
+
+```bash
+RCPU=2
+CORE=$(lscpu -p=CPU,CORE | grep -v '^#' | awk -F, -v c=$RCPU '$1==c{print $2}')
+DCPUS=$(lscpu -p=CPU,CORE | grep -v '^#' | awk -F, -v k=$CORE '$2!=k{printf "%s%s",s,$1; s=","}')
+echo "resolver on $RCPU, dnsperf on $DCPUS"
+```
+
+**Step 3: Define the benchmark function** (terminal 2; paste once):
+
+```bash
+bench(){
+  cfg=$1; proc=$2; PID=$(pgrep -x $proc)
+  [ -z "$PID" ] && { echo "ERROR: $proc is not running"; return 1; }
+  echo "== $cfg: $proc pid $PID, mode: $(ip -d link show veth-dns | grep -oE 'xdpgeneric|prog/xdp' | head -1)" | tee results/${cfg}_info.txt
+  for r in 1 2 3 4 5; do                       # max throughput
+    pidstat -u -p $PID 5 5 > results/${cfg}_tput_cpu_$r.txt &
+    sudo ip netns exec dnstest taskset -c $DCPUS dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 2000000 > results/${cfg}_tput_$r.txt
+    wait; echo "  tput run $r done"; sleep 30
+  done
+  for r in 1 2 3; do                           # latency + CPU at equal load
+    pidstat -u -p $PID 5 5 > results/${cfg}_lat_cpu_$r.txt &
+    mpstat 5 5 > results/${cfg}_lat_sys_$r.txt &
+    sudo ip netns exec dnstest taskset -c $DCPUS dnsperf -s 10.0.0.1 -d payload.txt -l 30 -c 8 -Q 150000 > results/${cfg}_lat_$r.txt
+    wait; echo "  lat run $r done"; sleep 30
+  done
+}
+```
+
+Each configuration takes about 6 minutes.
+
+**Step 4: Baseline.**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `bench sock socket_resolver`
+- When it finishes, press Ctrl-C in terminal 1.
+
+**Step 5: Config A (generic).**
+- Terminal 1: `sudo taskset -c 2 ./afxdp_resolver --local veth-dns --skb`
+- Terminal 2: `bench A afxdp_resolver`
+- Check that the first line printed shows `xdpgeneric`.
+- When it finishes, press Ctrl-C in terminal 1.
+
+**Step 6: Config B (native).**
+- Terminal 1: `sudo taskset -c 2 ./afxdp_resolver --local veth-dns --drv`
+- Terminal 2: `bench B afxdp_resolver`
+- Check that the first line printed shows `prog/xdp`.
+- When it finishes, press Ctrl-C in terminal 1.
+
+**Step 7: Print all the results** (terminal 2):
+
+```bash
+for cfg in sock A B; do for t in tput lat; do for f in results/${cfg}_${t}_[0-9].txt; do
+  r=${f##*_}; r=${r%.txt}
+  q=$(awk '/per second/{printf "%.0f",$4}' $f); l=$(awk '/Average Latency/{printf "%.0f",$4*1e6}' $f); lo=$(awk '/Queries lost/{print $3}' $f)
+  c=$(awk '/^Average/{print "usr="$4" sys="$5" cpu="$8}' results/${cfg}_${t}_cpu_$r.txt)
+  s=$( [ $t = lat ] && awk '/^Average/{printf "sys_busy=%.1f%% soft=%s", 100-$NF, $8}' results/${cfg}_lat_sys_$r.txt )
+  echo "$cfg $t r$r qps=$q lat_us=$l lost=$lo $c $s"
+done; done; done | tee results/summary.txt
+```
+
+Paste `results/summary.txt` here and I'll turn it into the report tables (mean ± s.d., speedup, CPU per query).
+
+**What each measurement means:**
+- **`tput` runs:** maximum QPS. If the resolver's `cpu` is clearly below ~95%, dnsperf was the bottleneck, so that QPS is a lower bound.
+- **`lat` runs:** latency and CPU at the same 150k QPS for all three. These give the fair efficiency comparison. `sys_busy` is total CPU use across the whole machine, which also counts kernel work that `pidstat` charges to other cores. If `sock` shows any lost queries at 150k, change it to `-Q 100000` and redo all three latency runs.
+
+Config C needs the second machine. When it's connected, use the same `bench` function with `dnsperf` running on that machine instead.
+cat summary.txt 
+sock tput r1 qps=306015 lat_us=305 lost=0 usr=8.92 sys=90.16 cpu=99.08 
+sock tput r2 qps=312640 lat_us=303 lost=0 usr=9.24 sys=90.08 cpu=99.32 
+sock tput r3 qps=312144 lat_us=303 lost=0 usr=9.04 sys=90.44 cpu=99.48 
+sock tput r4 qps=309891 lat_us=303 lost=0 usr=9.08 sys=90.24 cpu=99.32 
+sock tput r5 qps=310774 lat_us=304 lost=0 usr=9.24 sys=90.08 cpu=99.32 
+sock lat r1 qps=149999 lat_us=11 lost=0 usr=6.32 sys=63.52 cpu=69.84 sys_busy=29.5% soft=6.16
+sock lat r2 qps=149999 lat_us=11 lost=0 usr=5.64 sys=64.05 cpu=69.69 sys_busy=29.7% soft=6.20
+sock lat r3 qps=149999 lat_us=11 lost=0 usr=5.92 sys=63.73 cpu=69.65 sys_busy=29.4% soft=6.13
+A tput r1 qps=524272 lat_us=9 lost=0 usr=12.76 sys=60.08 cpu=72.84 
+A tput r2 qps=539620 lat_us=7 lost=0 usr=17.52 sys=82.00 cpu=99.52 
+A tput r3 qps=536143 lat_us=8 lost=0 usr=16.68 sys=82.72 cpu=99.40 
+A tput r4 qps=531399 lat_us=7 lost=0 usr=16.96 sys=82.44 cpu=99.40 
+A tput r5 qps=504569 lat_us=11 lost=0 usr=16.56 sys=82.16 cpu=98.72 
+A lat r1 qps=150000 lat_us=13 lost=0 usr=8.28 sys=52.02 cpu=60.30 sys_busy=32.0% soft=4.35
+A lat r2 qps=150000 lat_us=9 lost=0 usr=11.36 sys=48.40 cpu=59.76 sys_busy=31.8% soft=5.34
+A lat r3 qps=149999 lat_us=9 lost=0 usr=10.44 sys=49.04 cpu=59.48 sys_busy=31.5% soft=5.04
+B tput r1 qps=487563 lat_us=9 lost=0 usr=17.12 sys=81.32 cpu=98.44 
+B tput r2 qps=494510 lat_us=8 lost=0 usr=16.76 sys=82.28 cpu=99.04 
+B tput r3 qps=486489 lat_us=9 lost=0 usr=17.08 sys=81.96 cpu=99.04 
+B tput r4 qps=491345 lat_us=8 lost=0 usr=16.84 sys=82.16 cpu=99.00 
+B tput r5 qps=492899 lat_us=8 lost=0 usr=17.36 sys=81.40 cpu=98.76 
+B lat r1 qps=150000 lat_us=9 lost=0 usr=8.44 sys=51.20 cpu=59.64 sys_busy=30.7% soft=4.10
+B lat r2 qps=149999 lat_us=9 lost=0 usr=8.44 sys=51.08 cpu=59.52 sys_busy=30.7% soft=4.22
+B lat r3 qps=149999 lat_us=9 lost=0 usr=10.56 sys=49.08 cpu=59.64 sys_busy=31.1% soft=5.43
+
+These numbers are clean and consistent, and good enough for the report. Variation is under 3% everywhere except A at full throughput (2.6%), and no run lost a query.
+
+**Table 1: Maximum throughput** (5 runs each, resolver pinned to one core)
+
+| Config | XDP mode | QPS (mean ± s.d.) | vs. socket | Resolver CPU | CPU per query |
+|---|---|---|---|---|---|
+| Socket baseline | — | 310.3k ± 2.6k | 1.00× | 99.3% | 3.20 µs |
+| A: veth | generic | 527.2k ± 13.9k | **1.70×** | 99.3%* | 1.88 µs |
+| B: veth | native | 490.6k ± 3.4k | **1.58×** | 98.9% | 2.02 µs |
+
+\*A's run 1 shows 72.8% CPU while its QPS was normal; I treat it as a timing glitch at the start of the `pidstat` window and leave it out of the CPU figure.
+
+All three resolvers ran at about 99% CPU, so the resolver was the bottleneck and these are its real capacity, not limits of dnsperf.
+
+**Table 2: Equal load, 150k QPS** (3 runs each)
+
+| Config | Avg latency | Resolver CPU | usr / sys | CPU per query | Whole machine |
+|---|---|---|---|---|---|
+| Socket baseline | 11.0 µs | 69.7% | 6.0 / 63.8 | 4.65 µs | 2.36 cores |
+| A: generic | 10.3 µs | 59.9% | 10.0 / 49.8 | 3.99 µs | 2.54 cores |
+| B: native | 9.0 µs | 59.6% | 9.1 / 50.5 | 3.97 µs | 2.47 cores |
+
+**Findings for the report:**
+
+1. **AF_XDP gives 1.6–1.7× throughput** on the same core, with identical DNS code.
+2. **The baseline spends 90% of its time in the kernel** (`sys`), which shows where the cost of the socket path sits.
+3. **Generic mode beat native on veth** (527k vs 491k). This is consistent with the earlier sandbox result. My explanation, which you should present as an interpretation rather than a proven fact: veth packets start as SKBs from the sender's stack, so native XDP on veth has to convert each SKB into an XDP buffer, while generic mode works on the SKB directly. On veth, "native" therefore saves nothing. This is why config C on a real NIC matters.
+4. **AF_XDP still spends about 82% in `sys` at full load.** In copy mode, transmission happens inside the `sendto()` wake-up call, so it's charged to the resolver as kernel time, and every `poll()` is a syscall. Copy mode removes the IP/UDP/socket layers, not the kernel. Zero-copy plus busy-polling is what would cut this further.
+5. **The saving grows with load.** Per-query CPU drops 14% at 150k, but 41% at saturation (3.20 → 1.88 µs). The resolver processes up to 64 packets per wake-up, so it gets more efficient as load rises, while the socket resolver pays one syscall pair per packet regardless.
+6. **At equal load, whole-machine CPU did not drop** (2.36 vs 2.47–2.54 cores). The resolver's own process got cheaper, but some work shifts elsewhere, likely to the softirq and `sendto` paths on other cores. Over 8 cores the difference is small (~0.1–0.2 cores), but it belongs in the report as a limitation rather than being hidden.
+7. **Latency at full load (304 µs vs 8 µs) is queueing**, not processing time, because the socket resolver is saturated. At equal load the gap is small (11.0 vs 9–10 µs). Quote both, and label them that way.
+
+Also note that the baseline went from 219k in your first attempt to 310k now. Moving dnsperf off the resolver's hyperthread was responsible, and it's worth a sentence in the methods section.
+
+**What's left:**
+- **Config C** on the I219-LM, which needs the second machine. Run the same `bench` steps with dnsperf on the other computer.
+- **Optional:** a run with no CPU pinning, to show the setup works without careful tuning.
+
+sudo ip addr add 192.168.50.1/24 dev enp0s31f6
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ip link set enp0s31f6 up
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ethtool -K enp0s31f6 gro off
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ lspci | grep -i ethernet   
+00:1f.6 Ethernet controller: Intel Corporation Ethernet Connection (13) I219-LM (rev 20)
+
+The laptop side of config C is ready. These are the steps for the rest, one at a time.
+
+**Step 1: Stop NetworkManager from managing the port.** When the cable goes in, NetworkManager will try DHCP and can wipe the address you just set:
+
+```bash
+sudo nmcli device set enp0s31f6 managed no
+sudo ip addr add 192.168.50.1/24 dev enp0s31f6 2>/dev/null; ip -br addr show enp0s31f6
+```
+
+**Step 2: Connect the cable and check the link.**
+
+```bash
+ip -br link show enp0s31f6                                   # must show LOWER_UP
+ethtool enp0s31f6 | grep -E 'Speed|Duplex|Link detected'     # expect 1000Mb/s, Full, yes
+```
+
+Record the speed for the report.
+
+**Step 3: Set up the second machine** (assuming it runs Linux):
+
+```bash
+sudo nmcli device set <its-eth> managed no
+sudo ip addr add 192.168.50.2/24 dev <its-eth>; sudo ip link set <its-eth> up
+sudo ethtool -K <its-eth> gro off
+sudo apt install -y dnsperf sysstat openssh-server dnsutils
+nproc                                                        # note its core count
+```
+
+**Step 4: Check basic connectivity** (on the laptop):
+
+```bash
+ping -c3 192.168.50.2
+sudo ufw status            # if "active": sudo ufw allow from 192.168.50.0/24 to any port 53 proto udp
+```
+
+**Step 5: Set up passwordless SSH** from the laptop to the client, so the laptop can drive the whole run:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 2>/dev/null
+ssh-copy-id <client-user>@192.168.50.2
+CLIENT=<client-user>@192.168.50.2
+scp payload.txt $CLIENT:~/
+ssh $CLIENT 'dnsperf -h >/dev/null 2>&1 && echo dnsperf-ok'
+```
+
+**Step 6: Check that both resolvers answer over the real NIC.**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `ssh $CLIENT 'dig @192.168.50.1 github.com A +short'`, which should print `140.82.121.3`.
+- Ctrl-C terminal 1, then run `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb` and repeat the dig.
+- In terminal 2, check the mode: `ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp'` should print `xdpgeneric`.
+- Ctrl-C terminal 1.
+
+**Step 7: Confirm native mode is unavailable**, as evidence for the report:
+
+```bash
+sudo ./afxdp_resolver --local enp0s31f6 --drv
+```
+
+It should fail at `bpf_xdp_attach`. Save the error message.
+
+**Step 8: Define the config C benchmark function** (laptop terminal 2; paste once). It's the same as before, but dnsperf runs on the client and the client's CPU is logged too:
+
+```bash
+benchC(){
+  cfg=$1; proc=$2; PID=$(pgrep -x $proc)
+  [ -z "$PID" ] && { echo "ERROR: $proc is not running"; return 1; }
+  echo "== $cfg: $proc pid $PID, mode: $(ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp' | head -1)" | tee results/${cfg}_info.txt
+  for r in 1 2 3 4 5; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_tput_cpu_$r.txt &
+    ssh $CLIENT 'mpstat 5 5' > results/${cfg}_client_cpu_$r.txt &
+    ssh $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -c 8 -Q 2000000' > results/${cfg}_tput_$r.txt
+    wait; echo "  tput run $r done"; sleep 30
+  done
+  for r in 1 2 3; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_lat_cpu_$r.txt &
+    mpstat 5 5 > results/${cfg}_lat_sys_$r.txt &
+    ssh $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -c 8 -Q 150000' > results/${cfg}_lat_$r.txt
+    wait; echo "  lat run $r done"; sleep 30
+  done
+}
+```
+
+**Step 9: Baseline over the real NIC.**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `benchC sockC socket_resolver`
+- Ctrl-C terminal 1 when it's done.
+
+**Step 10: Config C.**
+- Terminal 1: `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb`
+- Terminal 2: `benchC C afxdp_resolver`
+- Ctrl-C terminal 1 when it's done.
+
+**Step 11: Print the summary.** This is the same loop as before, with the client's CPU added:
+
+```bash
+for cfg in sockC C; do for t in tput lat; do for f in results/${cfg}_${t}_[0-9].txt; do
+  r=${f##*_}; r=${r%.txt}
+  q=$(awk '/per second/{printf "%.0f",$4}' $f); l=$(awk '/Average Latency/{printf "%.0f",$4*1e6}' $f); lo=$(awk '/Queries lost/{print $3}' $f)
+  c=$(awk '/^Average/{print "usr="$4" sys="$5" cpu="$8}' results/${cfg}_${t}_cpu_$r.txt)
+  x=$( [ $t = tput ] && awk '/^Average/{printf "client_busy=%.1f%%", 100-$NF}' results/${cfg}_client_cpu_$r.txt )
+  s=$( [ $t = lat ] && awk '/^Average/{printf "sys_busy=%.1f%% soft=%s", 100-$NF, $8}' results/${cfg}_lat_sys_$r.txt )
+  echo "$cfg $t r$r qps=$q lat_us=$l lost=$lo $c $x $s"
+done; done; done | tee results/summary_C.txt
+```
+
+Paste `summary_C.txt` here. If the resolver's `cpu` is under about 95% while `client_busy` is high, the client machine was the limit, and the report should say so.
+
+**Step 12: Clean up.**
+
+```bash
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+sudo ip addr del 192.168.50.1/24 dev enp0s31f6
+sudo nmcli device set enp0s31f6 managed yes
+sudo cpupower frequency-set -g powersave
+```
+
+Undo the same settings on the client.
+
+got an arch linux supporting machine - give me complete steps
+
+dnsperf is in Arch's official `extra` repository ([archlinux.org](https://archlinux.org/packages/extra/x86_64/dnsperf)), so no AUR is needed. Here is the complete sequence, with the machine named at each step.
+
+## Arch client
+
+**C1. Install the tools:**
+
+```bash
+sudo pacman -Syu --needed dnsperf bind sysstat openssh ethtool iproute2 cpupower
+```
+
+`bind` provides `dig`, and `sysstat` provides `mpstat`.
+
+**C2. Find the Ethernet interface name:**
+
+```bash
+ip -br link            # e.g. enp2s0 or eno1. Use it wherever <eth> appears below
+nproc                  # note the core count
+```
+
+**C3. Stop whichever network manager is running from touching that port.** Check which one is active:
+
+```bash
+systemctl is-active NetworkManager systemd-networkd dhcpcd iwd
+```
+
+- **NetworkManager:** `sudo nmcli device set <eth> managed no`
+- **dhcpcd:** `sudo dhcpcd -x <eth>`
+- **systemd-networkd:** create a file that tells it to leave the port alone:
+
+```bash
+printf '[Match]\nName=<eth>\n\n[Link]\nUnmanaged=yes\n' | sudo tee /etc/systemd/network/10-bench.network
+sudo networkctl reload
+```
+
+**C4. Configure the port:**
+
+```bash
+sudo ip addr add 192.168.50.2/24 dev <eth>
+sudo ip link set <eth> up
+sudo ethtool -K <eth> gro off
+sudo cpupower frequency-set -g performance
+```
+
+**C5. Start SSH so the laptop can drive the runs:**
+
+```bash
+sudo systemctl start sshd
+whoami                  # note the username
+```
+
+## Cable and link
+
+**L1. Plug the cable into both machines, then check the link on each one:**
+
+```bash
+ip -br link show <iface>                                    # must show LOWER_UP
+ethtool <iface> | grep -E 'Speed|Duplex|Link detected'      # expect 1000Mb/s, Full, yes
+```
+
+Use `enp0s31f6` on the laptop and `<eth>` on the client.
+
+## Laptop (Ubuntu, the resolver)
+
+**L2. Configure the laptop's port**, if not already done:
+
+```bash
+sudo nmcli device set enp0s31f6 managed no
+sudo ip addr add 192.168.50.1/24 dev enp0s31f6 2>/dev/null
+sudo ip link set enp0s31f6 up
+sudo ethtool -K enp0s31f6 gro off
+sudo cpupower frequency-set -g performance
+ping -c3 192.168.50.2
+sudo ufw status            # if active: sudo ufw allow from 192.168.50.0/24 to any port 53 proto udp
+```
+
+**L3. Set up passwordless SSH to the client and copy the query file over:**
+
+```bash
+CLIENT=<client-user>@192.168.50.2
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 2>/dev/null
+ssh-copy-id $CLIENT
+scp payload.txt $CLIENT:~/
+ssh $CLIENT 'which dnsperf mpstat dig'      # all three paths must print
+```
+
+**L4. Check that both resolvers answer over the cable.**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `ssh $CLIENT 'dig @192.168.50.1 github.com A +short'`, which should print `140.82.121.3`.
+- Ctrl-C terminal 1, then run `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb` and repeat the dig.
+- Also run `ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp'`, which should print `xdpgeneric`.
+- Ctrl-C terminal 1.
+
+**L5. Record that native mode isn't available on this NIC:**
+
+```bash
+sudo ./afxdp_resolver --local enp0s31f6 --drv 2>&1 | tee results/C_drv_attempt.txt
+```
+
+It should fail at `bpf_xdp_attach`.
+
+**L6. Define the benchmark function** (terminal 2; paste once). It uses `-T 4` so a single dnsperf thread on the client isn't the limit:
+
+```bash
+mkdir -p results; sudo -v
+benchC(){
+  cfg=$1; proc=$2; PID=$(pgrep -x $proc)
+  [ -z "$PID" ] && { echo "ERROR: $proc is not running"; return 1; }
+  echo "== $cfg: $proc pid $PID, mode: $(ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp' | head -1)" | tee results/${cfg}_info.txt
+  for r in 1 2 3 4 5; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_tput_cpu_$r.txt &
+    ssh $CLIENT 'mpstat 5 5' > results/${cfg}_client_cpu_$r.txt &
+    ssh $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -T 4 -c 8 -Q 2000000' > results/${cfg}_tput_$r.txt
+    wait; echo "  tput run $r done"; sleep 30
+  done
+  for r in 1 2 3; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_lat_cpu_$r.txt &
+    mpstat 5 5 > results/${cfg}_lat_sys_$r.txt &
+    ssh $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -T 4 -c 8 -Q 150000' > results/${cfg}_lat_$r.txt
+    wait; echo "  lat run $r done"; sleep 30
+  done
+}
+```
+
+**L7. Baseline over the real NIC.**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `benchC sockC socket_resolver` (about 6 minutes)
+- Ctrl-C terminal 1 when it's done.
+
+**L8. Config C.**
+- Terminal 1: `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb`
+- Terminal 2: `benchC C afxdp_resolver`
+- Ctrl-C terminal 1 when it's done.
+
+**L9. Print the summary:**
+
+```bash
+for cfg in sockC C; do for t in tput lat; do for f in results/${cfg}_${t}_[0-9].txt; do
+  r=${f##*_}; r=${r%.txt}
+  q=$(awk '/per second/{printf "%.0f",$4}' $f); l=$(awk '/Average Latency/{printf "%.0f",$4*1e6}' $f); lo=$(awk '/Queries lost/{print $3}' $f)
+  c=$(awk '/^Average/{print "usr="$4" sys="$5" cpu="$8}' results/${cfg}_${t}_cpu_$r.txt)
+  x=$( [ $t = tput ] && awk '/^Average/{printf "client_busy=%.1f%%", 100-$NF}' results/${cfg}_client_cpu_$r.txt )
+  s=$( [ $t = lat ] && awk '/^Average/{printf "sys_busy=%.1f%% soft=%s", 100-$NF, $8}' results/${cfg}_lat_sys_$r.txt )
+  echo "$cfg $t r$r qps=$q lat_us=$l lost=$lo $c $x $s"
+done; done; done | tee results/summary_C.txt
+```
+
+Paste `summary_C.txt` here.
+
+## Cleanup
+
+**Laptop:**
+
+```bash
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+sudo ip addr del 192.168.50.1/24 dev enp0s31f6
+sudo nmcli device set enp0s31f6 managed yes
+sudo cpupower frequency-set -g powersave
+```
+
+**Arch client:**
+
+```bash
+sudo ip addr del 192.168.50.2/24 dev <eth>
+sudo rm -f /etc/systemd/network/10-bench.network && sudo networkctl reload   # only if you created it
+sudo nmcli device set <eth> managed yes                                       # only if NetworkManager
+sudo cpupower frequency-set -g powersave
+```
+
+Sources:
+- [dnsperf in Arch Linux extra](https://archlinux.org/packages/extra/x86_64/dnsperf)
+
+
+
+dnsperf target not f ound
+
+
+pacman's error ("target not found") means the package isn't in the repositories your machine currently knows about. dnsperf only recently moved into Arch's official `extra` repository, so a stale package database or a distro that lags behind Arch (Manjaro, EndeavourOS, etc.) can miss it. Work through these in order and stop at the first one that works.
+
+**1. Refresh the package database and search again:**
+
+```bash
+sudo pacman -Syy
+pacman -Ss dnsperf
+sudo pacman -S dnsperf
+```
+
+**2. If it's still not found, install from the AUR.** With an AUR helper:
+
+```bash
+yay -S dnsperf          # or: paru -S dnsperf
+```
+
+Without a helper, build it with makepkg, which pulls in the dependencies itself:
+
+```bash
+sudo pacman -S --needed base-devel git
+git clone https://aur.archlinux.org/dnsperf.git
+cd dnsperf
+makepkg -si
+```
+
+**3. Check that it installed:**
+
+```bash
+which dnsperf && dnsperf -h 2>&1 | head -2
+```
+
+Install the remaining tools too, if that step stopped partway:
+
+```bash
+sudo pacman -S --needed bind sysstat openssh ethtool iproute2 cpupower
+```
+
+If `makepkg` fails, paste the error. Also, if the machine runs Manjaro or another Arch-based distribution rather than Arch itself, say which one; the package names and repositories can differ.
+
+[devarshi@archloq ~]$ ip -br link 
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>  
+enp7s0           UP             40:c2:ba:5f:d9:98 <BROADCAST,MULTICAST,UP,LOWER_UP>  
+wlp8s0           UP             c0:35:32:66:47:e5 <BROADCAST,MULTICAST,UP,LOWER_UP>  
+CloudflareWARP   UNKNOWN        <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP>  
+[devarshi@archloq ]$ ^[[200~nproc 
+bash: $'\E[200~nproc~': command not found 
+[devarshi@archloq ~]$ nproc 
+16 
+[devarshi@archloq ~]$
+[devarshi@archloq ~]$ ip -br link 
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP>  
+enp7s0           UP             40:c2:ba:5f:d9:98 <BROADCAST,MULTICAST,UP,LOWER_UP>  
+wlp8s0           UP             c0:35:32:66:47:e5 <BROADCAST,MULTICAST,UP,LOWER_UP>  
+CloudflareWARP   UNKNOWN        <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP>  
+[devarshi@archloq ]$ ^[[200~nproc 
+bash: $'\E[200~nproc~': command not found 
+[devarshi@archloq ~]$ nproc 
+16 
+[devarshi@archloq ~]$
+
+The client's Ethernet port is **`enp7s0`**; use that wherever the steps say `<eth>`. It already shows `LOWER_UP`, so a cable is connected to something. With 16 CPUs, this machine is unlikely to limit dnsperf.
+
+The `^[[200~nproc` error is just a paste glitch in the terminal (bracketed paste); it doesn't affect anything.
+
+Two things to deal with first:
+
+**1. Turn off Cloudflare WARP for the benchmark.** WARP is a VPN, and it can intercept DNS (port 53) traffic and re-route packets, which would corrupt both the test and the measurements:
+
+```bash
+warp-cli disconnect
+warp-cli status          # should say Disconnected
+```
+
+Reconnect after the benchmark with `warp-cli connect`.
+
+**2. Make sure `enp7s0` is cabled to the laptop and not to a router:**
+
+```bash
+ip -br addr show enp7s0
+systemctl is-active NetworkManager systemd-networkd dhcpcd
+```
+
+If `enp7s0` already has an address such as `192.168.1.x` or `10.x`, it's probably plugged into a router or the LAN. Move the cable so it runs directly between `enp7s0` and the laptop's `enp0s31f6`.
+
+Then continue on the Arch client:
+
+```bash
+sudo nmcli device set enp7s0 managed no        # use the line matching what "is-active" printed (step C3 earlier)
+sudo ip addr flush dev enp7s0
+sudo ip addr add 192.168.50.2/24 dev enp7s0
+sudo ip link set enp7s0 up
+sudo ethtool -K enp7s0 gro off
+sudo cpupower frequency-set -g performance
+sudo systemctl start sshd
+ethtool enp7s0 | grep -E 'Speed|Duplex|Link detected'
+ping -c3 192.168.50.1
+```
+
+If the ping works, go to the laptop and continue from step L3 (SSH setup), using `CLIENT=devarshi@192.168.50.2`.
+
+
+DOWN 
+active 
+inactive
+inactive
+
+That output tells us two things:
+
+- **`enp7s0` is now `DOWN`**: no cable is connected, or the cable has just been moved.
+- **NetworkManager is the active network manager**; the other two are inactive. So the NetworkManager command is the one to use.
+
+On the Arch client:
+
+```bash
+warp-cli disconnect                              # if not done already
+sudo nmcli device set enp7s0 managed no
+sudo ip addr flush dev enp7s0
+sudo ip addr add 192.168.50.2/24 dev enp7s0
+sudo ip link set enp7s0 up
+sudo ethtool -K enp7s0 gro off
+sudo cpupower frequency-set -g performance
+sudo systemctl start sshd
+```
+
+Now run the cable directly from the client's `enp7s0` to the laptop's `enp0s31f6`, then check the link:
+
+```bash
+ip -br addr show enp7s0                                   # want: UP, 192.168.50.2/24
+ethtool enp7s0 | grep -E 'Speed|Duplex|Link detected'     # want: 1000Mb/s, Full, yes
+ping -c3 192.168.50.1
+```
+
+If it still shows `DOWN` or `Link detected: no`, there are three likely causes:
+- The laptop side isn't up. On the laptop, run `sudo ip link set enp0s31f6 up` and `ip -br addr show enp0s31f6`; it should show `192.168.50.1/24`.
+- The cable is faulty. Try another one; modern ports don't need a crossover cable.
+- NetworkManager on the laptop took the port back. Re-run `sudo nmcli device set enp0s31f6 managed no` there.
+
+Once the ping works, continue on the laptop from step L3, with `CLIENT=devarshi@192.168.50.2`.
+
+Nothing special is needed to receive them. If the link and addresses are right, the laptop's kernel answers pings automatically. To watch the packets arrive, and to find the problem if they don't:
+
+**1. On the laptop, watch the port:**
+
+```bash
+sudo tcpdump -ni enp0s31f6 icmp or arp
+```
+
+**2. On the Arch client, ping the laptop:**
+
+```bash
+ping -c3 192.168.50.1
+```
+
+**What tcpdump shows tells you where it's failing:**
+
+| tcpdump output on the laptop | Meaning | Fix |
+|---|---|---|
+| `ICMP echo request` **and** `echo reply` lines | Everything works | Nothing; continue with step L3 |
+| Only `ARP, Request who-has 192.168.50.1` and no reply | The laptop doesn't have the address | Laptop: `sudo ip addr add 192.168.50.1/24 dev enp0s31f6` |
+| `echo request` arrives, no `echo reply` | Laptop firewall is dropping ICMP | Laptop: `sudo ufw status`; if active, `sudo ufw allow from 192.168.50.0/24` |
+| Nothing at all | No link, or the client isn't sending on `enp7s0` | Check both sides as below |
+
+**If tcpdump shows nothing**, check on both machines:
+
+```bash
+# Laptop
+ip -br addr show enp0s31f6        # UP, LOWER_UP, 192.168.50.1/24
+ethtool enp0s31f6 | grep 'Link detected'
+
+# Arch client
+ip -br addr show enp7s0           # UP, LOWER_UP, 192.168.50.2/24
+ethtool enp7s0 | grep 'Link detected'
+ip route get 192.168.50.1         # must say "dev enp7s0", not wlp8s0 or CloudflareWARP
+warp-cli status                   # must be Disconnected
+```
+
+If `ip route get` names a different interface, WARP or the Wi-Fi is still claiming that route. Disconnect WARP and re-add the address on `enp7s0`.
+
+Paste the tcpdump output if it's still unclear.
+no tcpdump recieved , arch linux says destination host unreachable 
+
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo tcpdump -ni enp0s31f6 icmp or arp
+[sudo] password for divisht: 
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on enp0s31f6, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+
+"Destination host unreachable" means the client sent ARP requests asking for `192.168.50.1` and got no answer. Your tcpdump on the laptop, which also captures ARP, saw nothing at all. So the client's packets aren't reaching the laptop's port. Either the link isn't physically up, or the client is sending out of a different interface.
+
+Leave tcpdump running on the laptop and run these.
+
+**On the Arch client:**
+
+```bash
+ip -br addr show enp7s0
+ethtool enp7s0 | grep -E 'Speed|Link detected'
+ip route get 192.168.50.1
+ip neigh show 192.168.50.1
+nmcli device status | grep enp7s0
+```
+
+**On the laptop**, in another terminal:
+
+```bash
+ip -br addr show enp0s31f6
+ethtool enp0s31f6 | grep -E 'Speed|Link detected'
+```
+
+Paste all of it. Meanwhile, here's what each likely result points to:
+
+| What you see | Cause | Fix |
+|---|---|---|
+| `Link detected: no` on either side | Cable not seated, faulty cable, or a port is down | Reseat or swap the cable; on the laptop run `sudo ip link set enp0s31f6 up` |
+| Client `ip route get` says `dev wlp8s0` or `CloudflareWARP` | Another interface is claiming the route | `warp-cli disconnect`, then on the client: `sudo ip addr flush dev enp7s0 && sudo ip addr add 192.168.50.2/24 dev enp7s0` |
+| `enp7s0` has no `192.168.50.2` | NetworkManager removed the address | `sudo nmcli device set enp7s0 managed no`, then add the address again |
+| Laptop's `enp0s31f6` has no `192.168.50.1` | Same thing on the laptop | `sudo nmcli device set enp0s31f6 managed no && sudo ip addr add 192.168.50.1/24 dev enp0s31f6` |
+| Both say `Link detected: yes` and the addresses are right | Something is still blocking the packets | Paste the outputs |
+
+One more possibility on the laptop: the Latitude BIOS has a "LAN/WLAN switching" option that disables the wired port while Wi-Fi is connected. If the laptop shows `Link detected: no` even with a known-good cable, try `nmcli radio wifi off` on the laptop temporarily and check again.
+
+
+
+The `netlink error` is harmless. `ethtool` was run without `sudo`, so it couldn't read some details, but it still reported the part that matters. If it says `Link detected: yes`, the cable and the client's port are fine. Run it with `sudo` to also get the speed:
+
+```bash
+sudo ethtool enp7s0 | grep -E 'Speed|Duplex|Link detected'
+```
+
+With the client's link confirmed, the problem is the client's addressing or routing, or the laptop's side. Run the rest of the checks.
+
+**On the Arch client:**
+
+```bash
+ip -br addr show enp7s0
+ip route get 192.168.50.1
+warp-cli status
+```
+
+**On the laptop:**
+
+```bash
+ip -br addr show enp0s31f6
+sudo ethtool enp0s31f6 | grep -E 'Speed|Link detected'
+```
+
+Paste all five outputs. The two most likely results:
+- The client's `ip route get` names `CloudflareWARP` or `wlp8s0` instead of `enp7s0`.
+- The laptop shows `Link detected: no` or is missing `192.168.50.1`.
+
+The table in my previous message has the fix for either.
+dev enp7s0 FAILED
+That narrows it down. `FAILED` on `dev enp7s0` means the client is doing everything right: the route goes out `enp7s0`, it sends ARP requests for `192.168.50.1`, and no reply ever comes back. The client's side is fine; **the problem is on the laptop**.
+
+Keep the client pinging (`ping 192.168.50.1`, left running) and run this on the laptop:
+
+```bash
+ip -br addr show enp0s31f6
+sudo ethtool enp0s31f6 | grep -E 'Speed|Link detected'
+ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp'
+ip -s link show enp0s31f6 | sed -n '3,4p'; sleep 3; ip -s link show enp0s31f6 | sed -n '3,4p'
+```
+
+The last line prints the port's receive counters twice, 3 seconds apart. Read the results like this:
+
+| Laptop shows | Meaning | Fix |
+|---|---|---|
+| `Link detected: no` | The laptop's port has no link | Run `sudo ip link set enp0s31f6 up`, reseat the cable at the laptop end, and try `nmcli radio wifi off` (the Dell BIOS LAN/WLAN switching option) |
+| Link yes, **RX counter rising**, but tcpdump still silent | Packets arrive but something takes them before tcpdump sees them, most likely a leftover XDP program | `sudo ip link set enp0s31f6 xdpgeneric off; sudo ip link set enp0s31f6 xdp off`, then ping again |
+| Link yes, RX counter not changing | Packets aren't reaching this port | Check the cable is in the laptop's Ethernet port and not a dock, and swap the cable |
+| No `192.168.50.1/24` | Address missing | `sudo nmcli device set enp0s31f6 managed no && sudo ip addr add 192.168.50.1/24 dev enp0s31f6` |
+
+Paste the output. The receive counter in particular tells us whether any packets are reaching the laptop at all.
+
+divisht@divisht-Latitude-5420:~$ ip -br addr show enp0s31f6
+sudo ethtool enp0s31f6 | grep -E 'Speed|Link detected'
+ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp'
+ip -s link show enp0s31f6 | sed -n '3,4p'; sleep 3; ip -s link show enp0s31f6 | sed -n '3,4p'
+enp0s31f6        UP             192.168.50.1/24 
+	Speed: 1000Mb/s
+	Link detected: yes
+    RX:  bytes packets errors dropped  missed   mcast           
+        120586     745      0       0       0     421 
+    RX:  bytes packets errors dropped  missed   mcast           
+        120586     745      0       0       0     421
+        
+        
+The laptop's side is fine: link up at 1000 Mb/s, address set, no XDP program attached. But the **receive counter didn't move at all** while the client was pinging (745 → 745). The client's ARP requests aren't reaching the laptop's port, so the problem is on the client.
+
+**The likely cause is Cloudflare WARP.** It installs its own firewall and routing rules, which can block LAN traffic even when the route looks correct. On the Arch client:
+
+```bash
+warp-cli status                                # must say Disconnected
+sudo nft list tables | grep -i -E 'warp|cloudflare'
+```
+
+If `warp-cli status` doesn't say `Disconnected`, or the `nft` command prints a WARP table, stop the service completely, not just the tunnel:
+
+```bash
+warp-cli disconnect
+sudo systemctl stop warp-svc
+sudo nft list tables | grep -i -E 'warp|cloudflare'     # should now print nothing
+```
+
+**Then check whether packets are leaving the client at all.** On the client, keep `ping 192.168.50.1` running in one terminal, and in another run:
+
+```bash
+sudo tcpdump -ni enp7s0 arp or icmp -c 6
+ip -s link show enp7s0 | sed -n '5,6p'; sleep 3; ip -s link show enp7s0 | sed -n '5,6p'   # TX counters
+```
+
+| Client shows | Meaning | Fix |
+|---|---|---|
+| tcpdump shows `ARP, Request who-has 192.168.50.1` and TX rises, laptop RX still flat | Frames leave the client but don't arrive | Physical problem: swap the cable, or try a different port |
+| No ARP in tcpdump and TX flat | Something on the client blocks it before the wire | WARP or another firewall; stop `warp-svc` as above, and check `sudo systemctl status firewalld` |
+| ARP shown and laptop RX starts rising | Fixed | Ping should work now |
+
+Once ping replies come back, restart WARP only after the benchmark: `sudo systemctl start warp-svc && warp-cli connect`.
+destination host unreachable still the error
+
+The ping error alone doesn't tell us where the packets stop. I need the output of the client checks from my last message. Run these on the Arch client and paste everything:
+
+```bash
+warp-cli status
+systemctl is-active warp-svc firewalld
+sudo nft list tables
+ip -br addr show enp7s0
+ip route get 192.168.50.1
+```
+
+Then, with `ping 192.168.50.1` running in another terminal on the client:
+
+```bash
+sudo tcpdump -ni enp7s0 arp or icmp -c 6
+ip -s link show enp7s0 | sed -n '5,6p'; sleep 3; ip -s link show enp7s0 | sed -n '5,6p'
+```
+
+There's also a quick physical test to confirm the cable really connects these two ports:
+
+1. On the client, run `watch -n1 "cat /sys/class/net/enp7s0/carrier"`. It should show `1`.
+2. Unplug the cable **at the laptop end**.
+3. If the client's value changes to `0` within a second, the cable really joins the two machines. If it stays at `1`, the client's port is connected to something else, such as a wall socket, a switch or a dock, and not to the laptop.
+
+Plug the cable back in afterwards. Report what the carrier value did, along with the outputs above.
+
+
+The screenshot rules out the obvious causes on the client:
+
+- **The link is good:** 1000 Mb/s, full duplex, and the client negotiated "master" with the laptop as "slave". That only happens with a live device on the other end of the cable, so the cable does go to the laptop.
+- **The route is correct:** `192.168.50.1 dev enp7s0 src 192.168.50.2`.
+- **WARP isn't involved:** it's disconnected and has no firewall tables.
+- **ARP fails:** the client asks for the laptop's MAC address and never gets an answer.
+
+So the link is up, but frames aren't making it across in at least one direction. The two most likely causes are:
+
+- **A driver or firmware problem on the client's NIC.** Realtek chips (the `r8169` driver) can show a link but pass no traffic when the firmware package is missing.
+- **A Docker network on the laptop using `192.168.50.0/24`**, so the laptop's replies go out the wrong interface.
+
+Run these four tests in order.
+
+**Test 1: Client NIC driver** (Arch):
+
+```bash
+ethtool -i enp7s0 | head -3
+sudo dmesg | grep -iE 'enp7s0|r8169|r8125|firmware' | tail -15
+```
+
+**Test 2: Address conflict on the laptop:**
+
+```bash
+ip route get 192.168.50.2          # must say "dev enp0s31f6"
+ip -br addr | grep 192.168.50
+docker network ls -q | xargs -r docker network inspect -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null
+```
+
+**Test 3: Watch both ends at the same time, client to laptop.**
+- Laptop: `sudo tcpdump -eni enp0s31f6 arp or icmp`
+- Client, terminal A: `sudo tcpdump -eni enp7s0 arp or icmp`
+- Client, terminal B: `ping -c5 192.168.50.1`
+
+**Test 4: The reverse direction, laptop to client.**
+- Keep both tcpdumps running.
+- Laptop: `ping -c5 192.168.50.2`
+
+How to read the results:
+
+| Result | Cause | Fix |
+|---|---|---|
+| Test 2: route says `dev br-…` or `docker0`, or a Docker network shows `192.168.50.0/24` | Docker owns the subnet | Use `192.168.77.0/24` on both machines instead |
+| Test 3: the client's tcpdump shows its own ARP requests, the laptop's shows nothing | The client's NIC isn't putting frames on the wire | Install firmware on the client: `sudo pacman -S linux-firmware`, reboot, retry |
+| Test 4: the laptop's ARP shows up on the client's tcpdump, but there's no reply | The client receives but doesn't transmit, the same driver issue | Same fix: firmware, plus check `dmesg` |
+| Both directions show nothing on the receiving side | The physical path is bad despite the link light | Swap the cable |
+
+Paste the output of all four tests, especially `ethtool -i` and `dmesg`.
+
+sudo tcpdump -ni enp0s31f6 icmp or arp
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on enp0s31f6, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+05:01:58.443412 IP 192.168.50.2 > 192.168.50.1: ICMP echo request, id 29185, seq 65, length 64
+05:01:58.443443 IP 192.168.50.1 > 192.168.50.2: ICMP echo reply, id 29185, seq 65, length 64
+05:01:59.467934 IP 192.168.50.2 > 192.168.50.1: ICMP echo request, id 29185, seq 66, length 64
+05:01:59.467965 IP 192.168.50.1 > 192.168.50.2: ICMP echo reply, id 29185, seq 66, length 64
+05:02:00.491729 IP 192.168.50.2 > 192.168.50.1: ICMP echo request, id 29185, seq 67, length 64
+05:02:00.491759 IP 192.168.50.1 > 192.168.50.2: ICMP echo reply, id 29185, seq 67, length 64
+^C
+6 packets captured
+6 packets received by filter
+0 packets dropped by kernel
+
+Ping works now. The laptop is receiving the client's echo requests and replying within about 30 µs. I can't tell which change fixed it, but the link carries traffic in both directions, and that's all the benchmark needs.
+
+Before continuing, confirm on the Arch client that the replies arrive there too:
+
+```bash
+ping -c3 192.168.50.1          # expect "64 bytes from 192.168.50.1", 0% loss
+```
+
+Then continue from step L3.
+
+**L3. On the laptop, set up passwordless SSH and copy the query file to the client:**
+
+```bash
+CLIENT=devarshi@192.168.50.2
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 2>/dev/null
+ssh-copy-id $CLIENT
+scp ~/AF-XDP_DNS-Resolver/payload.txt $CLIENT:~/
+ssh $CLIENT 'which dnsperf mpstat dig'      # all three paths must print
+```
+
+If `ssh-copy-id` says `connection refused`, run `sudo systemctl start sshd` on the client.
+
+**L4. Check that both resolvers answer over the cable.**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `ssh $CLIENT 'dig @192.168.50.1 github.com A +short'`, which should print `140.82.121.3`.
+- Ctrl-C terminal 1, then run `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb` and repeat the dig.
+- Also run `ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp'`, which should print `xdpgeneric`.
+- Ctrl-C terminal 1.
+
+**L5. Record that native mode isn't available:**
+
+```bash
+mkdir -p results
+sudo ./afxdp_resolver --local enp0s31f6 --drv 2>&1 | tee results/C_drv_attempt.txt
+```
+
+Then carry on with L6 (define `benchC`), L7 (baseline), L8 (config C) and L9 (summary) from the Arch steps message. `CLIENT` is a shell variable, so set it again in any new terminal before using `benchC`.
+
+If the ping drops again during the runs, a likely cause is NetworkManager reclaiming one of the ports. Re-run `sudo nmcli device set <port> managed no` on that machine and add the address again.
+ssh $CLIENT 'dig @192.168.50.1 github.com A +short'
+hostname contains invalid characters
+
+
+That error means `$CLIENT` is empty in this terminal. Shell variables only exist in the terminal where you set them, so `ssh` ended up treating the `dig …` command as a hostname.
+
+Set it in this terminal and retry:
+
+```bash
+CLIENT=devarshi@192.168.50.2
+echo $CLIENT                                         # should print devarshi@192.168.50.2
+ssh $CLIENT 'dig @192.168.50.1 github.com A +short'  # expect 140.82.121.3
+```
+
+To avoid this in every new terminal, either save it once:
+
+```bash
+echo 'export CLIENT=devarshi@192.168.50.2' >> ~/.bashrc && source ~/.bashrc
+```
+
+or write the address out in full: `ssh devarshi@192.168.50.2 '…'`.
+
+The `benchC` function also uses `$CLIENT`. Make sure it's set in the terminal where you run `benchC`, or every run will fail the same way.
+
+
+
+done till L4 , now how to actually do the benchmarking
+With L4 done, the rest is L5–L9. The `benchC` function is repeated below, so you don't need to scroll back.
+
+**Step 1: Prepare terminal 2** (the one that will drive the runs), on the laptop:
+
+```bash
+cd ~/AF-XDP_DNS-Resolver
+export CLIENT=devarshi@192.168.50.2
+mkdir -p results
+sudo -v
+ssh $CLIENT 'echo ok'                      # must print ok without asking for a password
+sudo cpupower frequency-set -g performance
+ssh -t $CLIENT 'sudo cpupower frequency-set -g performance'
+```
+
+**Step 2: Record that native mode isn't supported** (terminal 2):
+
+```bash
+sudo ./afxdp_resolver --local enp0s31f6 --drv 2>&1 | tee results/C_drv_attempt.txt
+```
+
+It should fail at `bpf_xdp_attach`. If it starts running instead, press Ctrl-C and tell me.
+
+**Step 3: Define `benchC`** (terminal 2; paste once):
+
+```bash
+benchC(){
+  cfg=$1; proc=$2; PID=$(pgrep -x $proc)
+  [ -z "$PID" ] && { echo "ERROR: $proc is not running"; return 1; }
+  [ -z "$CLIENT" ] && { echo "ERROR: CLIENT not set"; return 1; }
+  echo "== $cfg: $proc pid $PID, mode: $(ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp' | head -1)" | tee results/${cfg}_info.txt
+  for r in 1 2 3 4 5; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_tput_cpu_$r.txt &
+    ssh $CLIENT 'mpstat 5 5' > results/${cfg}_client_cpu_$r.txt &
+    ssh $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -T 4 -c 8 -Q 2000000' > results/${cfg}_tput_$r.txt
+    wait; echo "  tput run $r done"; sleep 30
+  done
+  for r in 1 2 3; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_lat_cpu_$r.txt &
+    mpstat 5 5 > results/${cfg}_lat_sys_$r.txt &
+    ssh $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -T 4 -c 8 -Q 150000' > results/${cfg}_lat_$r.txt
+    wait; echo "  lat run $r done"; sleep 30
+  done
+}
+```
+
+**Step 4: Baseline run** (about 6 minutes):
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `benchC sockC socket_resolver`
+- Wait for `lat run 3 done`, then press Ctrl-C in terminal 1.
+
+**Step 5: Config C run** (about 6 minutes):
+- Terminal 1: `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb`
+- Terminal 2: `benchC C afxdp_resolver`
+- Check that the first printed line says `mode: xdpgeneric`.
+- Wait for `lat run 3 done`, then press Ctrl-C in terminal 1.
+
+**Step 6: Quick sanity check** before trusting the numbers:
+
+```bash
+grep -h 'Queries lost' results/sockC_tput_1.txt results/C_tput_1.txt
+grep -h 'per second' results/sockC_tput_*.txt results/C_tput_*.txt
+```
+
+Both should show real QPS values and few or no lost queries. If a file is empty, the ssh or dnsperf call failed, so check that `$CLIENT` is set and that `ssh $CLIENT 'dnsperf -h'` works.
+
+**Step 7: Summary** (terminal 2):
+
+```bash
+for cfg in sockC C; do for t in tput lat; do for f in results/${cfg}_${t}_[0-9].txt; do
+  r=${f##*_}; r=${r%.txt}
+  q=$(awk '/per second/{printf "%.0f",$4}' $f); l=$(awk '/Average Latency/{printf "%.0f",$4*1e6}' $f); lo=$(awk '/Queries lost/{print $3}' $f)
+  c=$(awk '/^Average/{print "usr="$4" sys="$5" cpu="$8}' results/${cfg}_${t}_cpu_$r.txt)
+  x=$( [ $t = tput ] && awk '/^Average/{printf "client_busy=%.1f%%", 100-$NF}' results/${cfg}_client_cpu_$r.txt )
+  s=$( [ $t = lat ] && awk '/^Average/{printf "sys_busy=%.1f%% soft=%s", 100-$NF, $8}' results/${cfg}_lat_sys_$r.txt )
+  echo "$cfg $t r$r qps=$q lat_us=$l lost=$lo $c $x $s"
+done; done; done | tee results/summary_C.txt
+```
+
+Paste `summary_C.txt` along with `results/C_drv_attempt.txt`.
+
+**Step 8: Clean up.**
+
+Laptop:
+
+```bash
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+sudo ip addr del 192.168.50.1/24 dev enp0s31f6
+sudo nmcli device set enp0s31f6 managed yes
+sudo cpupower frequency-set -g powersave
+```
+
+Arch client:
+
+```bash
+sudo ip addr del 192.168.50.2/24 dev enp7s0
+sudo nmcli device set enp7s0 managed yes
+sudo cpupower frequency-set -g powersave
+warp-cli connect
+```
+
+sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb
+xsk_socket__create: Device or resource busy
+
+ BASELINE works , next one we are stuck again
+ 
+ `Device or resource busy` at `xsk_socket__create` almost always means **another AF_XDP socket is still bound to queue 0 of `enp0s31f6`**. Usually that's an earlier `afxdp_resolver` still running, from the L4 check or the `--drv` attempt in step 2, or one whose socket hasn't been released yet.
+
+Run these on the laptop in order, and stop as soon as the resolver starts.
+
+**1. Find and stop any leftover resolver:**
+
+```bash
+pgrep -a afxdp_resolver                 # anything listed is a leftover
+sudo pkill -INT -x afxdp_resolver; sleep 2
+sudo pkill -KILL -x afxdp_resolver 2>/dev/null
+```
+
+**2. Check for leftover AF_XDP sockets and XDP programs:**
+
+```bash
+ss --xdp -a                                   # should list nothing for enp0s31f6
+ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp'
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+sudo ip link set enp0s31f6 xdp off 2>/dev/null
+```
+
+**3. Retry:**
+
+```bash
+sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb
+```
+
+**4. If it's still busy, reset the port.** Taking it down and up releases any stuck queue binding:
+
+```bash
+sudo ip link set enp0s31f6 down
+sudo ip link set enp0s31f6 up
+sleep 3
+ip -br addr show enp0s31f6                    # re-add 192.168.50.1/24 if it's gone
+ping -c2 192.168.50.2                         # link back?
+sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb
+```
+
+Once it starts, check the mode with `ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp'`, which should print `xdpgeneric`. Then run `benchC C afxdp_resolver` in terminal 2.
+
+If it still fails after step 4, paste the output of `pgrep -a afxdp_resolver`, `ss --xdp -a`, and `sudo dmesg | tail -20`.
+
+for cfg in sockC C; do for t in tput lat; do for f in results/${cfg}_${t}_[0-9].txt; do
+  r=${f##*_}; r=${r%.txt}
+  q=$(awk '/per second/{printf "%.0f",$4}' $f); l=$(awk '/Average Latency/{printf "%.0f",$4*1e6}' $f); lo=$(awk '/Queries lost/{print $3}' $f)
+  c=$(awk '/^Average/{print "usr="$4" sys="$5" cpu="$8}' results/${cfg}_${t}_cpu_$r.txt)
+  x=$( [ $t = tput ] && awk '/^Average/{printf "client_busy=%.1f%%", 100-$NF}' results/${cfg}_client_cpu_$r.txt )
+  s=$( [ $t = lat ] && awk '/^Average/{printf "sys_busy=%.1f%% soft=%s", 100-$NF, $8}' results/${cfg}_lat_sys_$r.txt )
+  echo "$cfg $t r$r qps=$q lat_us=$l lost=$lo $c $x $s"
+done; done; done | tee results/summary_C.txt
+sockC tput r1 qps=376981 lat_us=258 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=5.7% 
+sockC tput r2 qps=376790 lat_us=259 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=7.2% 
+sockC tput r3 qps=376603 lat_us=259 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=6.2% 
+sockC tput r4 qps=376192 lat_us=259 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=6.6% 
+sockC tput r5 qps=378569 lat_us=257 lost=0 usr=0.00 sys=0.00 cpu=0.00 client_busy=5.7% 
+sockC lat r1 qps=150000 lat_us=119 lost=0 usr=0.00 sys=0.00 cpu=0.00  sys_busy=11.1% soft=3.48
+sockC lat r2 qps=150000 lat_us=111 lost=0 usr=0.00 sys=0.00 cpu=0.00  sys_busy=11.5% soft=4.38
+sockC lat r3 qps=126193 lat_us=120 lost=128 usr=0.00 sys=0.00 cpu=0.00  sys_busy=11.8% soft=3.46
+C tput r1 qps=377344 lat_us=258 lost=0 usr=9.96 sys=40.04 cpu=50.00 client_busy=5.9% 
+C tput r2 qps=378046 lat_us=257 lost=0 usr=9.88 sys=40.44 cpu=50.32 client_busy=5.8% 
+C tput r3 qps=376941 lat_us=258 lost=0 usr=9.96 sys=40.32 cpu=50.28 client_busy=6.0% 
+C tput r4 qps=376515 lat_us=259 lost=0 usr=10.32 sys=39.88 cpu=50.20 client_busy=6.2% 
+C tput r5 qps=376324 lat_us=259 lost=0 usr=9.76 sys=40.56 cpu=50.32 client_busy=5.9% 
+C lat r1 qps=150000 lat_us=107 lost=0 usr=8.40 sys=27.52 cpu=35.92  sys_busy=11.7% soft=4.56
+C lat r2 qps=150000 lat_us=122 lost=0 usr=11.88 sys=33.56 cpu=45.44  sys_busy=11.4% soft=4.13
+C lat r3 qps=150000 lat_us=104 lost=0 usr=9.32 sys=31.60 cpu=40.92  sys_busy=10.5% soft=3.82
+
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ ssh $CLIENT 'mpstat -P ALL 5 1' > results/client_percpu.txt &
+[1] 1636035
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ ssh $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 10 -T 4 -c 8 -Q 2000000' | grep 'per second'
+  Queries per second:   374550.701293
+
+[1]+  Stopped                 ssh $CLIENT 'mpstat -P ALL 5 1' > results/client_percpu.txt
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ wait; awk '/Average/ && $2 ~ /^[0-9]+$/ && (100-$NF) > 50 {print "client CPU", $2, "busy", 100-$NF"%", "soft", $8"%"}' results/client_percpu.txt
+bash: wait: warning: job 1[1636035] stopped
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ for opts in "-T 8 -c 32" "-T 12 -c 64"; do
+  echo "== $opts"; ssh $CLIENT "dnsperf -s 192.168.50.1 -d payload.txt -l 10 $opts -Q 2000000" | grep 'per second'
+done
+== -T 8 -c 32
+  Queries per second:   371540.976302
+== -T 12 -c 64
+  Queries per second:   370450.686046
+  
+  Two things are going on here.
+
+**1. The client's `mpstat` job got stuck, which is my mistake.** An `ssh` started in the background with `&` stops as soon as it tries to read from the keyboard (`Stopped`). It needs `-n`. Clear it:
+
+```bash
+kill %1 2>/dev/null; wait 2>/dev/null
+```
+
+**2. More dnsperf threads don't help.** The rate stayed at ~371–377k with 4, 8 and 12 threads, so dnsperf isn't the limit. Something on the packet path caps out at about 375k packets per second, and both resolvers hit it. The likely candidates:
+
+- **The laptop's `e1000e` receive interrupt.** The I219 has a single receive queue, so one laptop core does all the driver work: receiving, generic XDP, and transmit completions. That work runs in softirq context, so it never shows up in the resolver's own CPU figure. That would explain why AF_XDP sat at only 50%.
+- **The client NIC's single receive queue** on the Arch machine, in the same way.
+
+The test below shows which one it is.
+
+## Find the hot core
+
+Keep the AF_XDP resolver running in terminal 1. In terminal 2 on the laptop:
+
+```bash
+grep -E 'CPU|enp0s31f6' /proc/interrupts | head -3          # which CPU takes the NIC's interrupts
+ssh -n $CLIENT 'mpstat -P ALL 5 1' > results/client_percpu.txt &
+mpstat -P ALL 5 1 > results/laptop_percpu.txt &
+ssh -n $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 10 -T 4 -c 8 -Q 2000000' | grep 'per second'
+wait
+for m in laptop client; do echo "== $m"; awk '/Average/ && $2 ~ /^[0-9]+$/ && (100-$NF) > 40 {printf "CPU %s busy %.0f%%  usr %s sys %s irq %s soft %s\n", $2, 100-$NF, $3, $5, $7, $8}' results/${m}_percpu.txt; done
+```
+
+| What it shows | Bottleneck | What goes in the report |
+|---|---|---|
+| A **laptop** core near 100%, mostly `soft`/`irq`, matching the CPU in `/proc/interrupts` | The laptop's single-queue `e1000e` driver path | The server NIC/driver caps both resolvers at ~375k pps; the comparison is CPU per query |
+| A **client** core near 100%, mostly `soft` | The client NIC's receive path | Results are client-bound at ~375k; same conclusion |
+| No core near 100% | Interrupt throttling or a hardware packet-rate limit | Check `ethtool -c enp0s31f6` and report it as a NIC limit |
+
+Either way, the cap is a hardware or driver limit at about 375k packets per second, not your code. On this NIC the fair comparison is **CPU per query at equal load**, which the sockC rerun will provide.
+
+## Fix `benchC` before the rerun
+
+Re-paste it with `-n` added to every `ssh`:
+
+```bash
+benchC(){
+  cfg=$1; proc=$2; PID=$(pgrep -x $proc)
+  [ -z "$PID" ] && { echo "ERROR: $proc is not running"; return 1; }
+  [ "$(echo "$PID" | wc -l)" -ne 1 ] && { echo "ERROR: more than one $proc running"; return 1; }
+  [ -z "$CLIENT" ] && { echo "ERROR: CLIENT not set"; return 1; }
+  echo "== $cfg: $proc pid $PID, mode: $(ip -d link show enp0s31f6 | grep -oE 'xdpgeneric|prog/xdp' | head -1)" | tee results/${cfg}_info.txt
+  for r in 1 2 3 4 5; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_tput_cpu_$r.txt &
+    mpstat -P ALL 5 5 > results/${cfg}_tput_percpu_$r.txt &
+    ssh -n $CLIENT 'mpstat 5 5' > results/${cfg}_client_cpu_$r.txt &
+    ssh -n $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -T 4 -c 8 -Q 2000000' > results/${cfg}_tput_$r.txt
+    wait; echo "  tput run $r done"; sleep 30
+  done
+  for r in 1 2 3; do
+    pidstat -u -p $PID 5 5 > results/${cfg}_lat_cpu_$r.txt &
+    mpstat 5 5 > results/${cfg}_lat_sys_$r.txt &
+    ssh -n $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 30 -T 4 -c 8 -Q 150000' > results/${cfg}_lat_$r.txt
+    wait; echo "  lat run $r done"; sleep 30
+  done
+}
+```
+
+This version also refuses to start if more than one resolver is running, which guards against the cause of sockC's 0% CPU readings. It also saves the laptop's per-core usage during the throughput runs, so the bottleneck core is recorded in the results.
+
+Then rerun step 4 from my previous message, sockC first and then C, and paste the hot-core output and the new summary.
+
+
+
+**What the command did:**
+1. It recorded per-core CPU usage on both machines for 5 seconds (`mpstat -P ALL 5 1`), on the laptop locally and on the client over SSH.
+2. While that was recording, it ran a 10-second dnsperf load. That gave 372k QPS again.
+3. The final `awk` line read both recordings and printed only the cores that were **more than 40% busy**, to find an overloaded one.
+
+**What the result means:** both sections came back empty, so **no core on either machine was over 40% busy**. Neither machine is CPU-bound, and neither NIC's interrupt core is saturated either. The ~375k ceiling isn't a CPU limit anywhere.
+
+Your earlier numbers point to the actual cause. **dnsperf allows at most 100 queries in flight by default** (its `-q` option). Little's law caps throughput at in-flight queries ÷ round-trip time:
+
+```
+100 queries in flight ÷ 258 µs round trip ≈ 388k QPS    (you measured ~377k)
+```
+
+So the benchmark is waiting on round trips, not on CPU. The cable path takes about 100–250 µs per round trip, mostly from NIC interrupt moderation, compared with 8 µs on veth. With only 100 queries allowed in flight, dnsperf can't send faster, and both resolvers end up at the same number. On veth the round trip was so short that the 100 limit never mattered.
+
+To confirm it and push past the cap, keep the AF_XDP resolver running and run this in terminal 2:
+
+```bash
+for q in 100 500 2000 5000; do
+  echo "== -q $q"; ssh -n $CLIENT "dnsperf -s 192.168.50.1 -d payload.txt -l 10 -T 4 -c 8 -q $q -Q 2000000" | grep -E 'per second|Average Latency|lost'
+done
+```
+
+To also see the busiest cores, whatever their level:
+
+```bash
+for m in laptop client; do echo "== $m"; awk '/Average/ && $2 ~ /^[0-9]+$/ {printf "%5.1f%% CPU %s  soft %s\n", 100-$NF, $2, $8}' results/${m}_percpu.txt | sort -rn | head -3; done
+```
+
+**What to do with the result:**
+- **If QPS rises with `-q`**, that confirms it. Pick the smallest `-q` that gives the peak, add it to the throughput dnsperf line in `benchC` (for example `-q 2000`), and rerun sockC and C. Leave the 150k latency runs without `-q`, as they're not affected.
+- **If QPS stays at about 375k even at `-q 5000`**, rerun the hot-core check during that run and paste the output. The limit is then somewhere else, most likely the NIC itself.
+
+The `-q` test rules out my explanation. Allowing more queries in flight didn't raise throughput; it only made the queue longer:
+
+| `-q` (max in flight) | QPS | Avg latency |
+|---|---|---|
+| 100 | 374.7k | 260 µs |
+| 500 | 376.7k | 1,318 µs |
+| 2000 | 369.5k | 4,863 µs |
+| 5000 | 369.7k | 4,850 µs |
+
+Throughput is fixed at about **372k QPS** whatever dnsperf does. Extra queries just wait in a queue, and nothing is dropped. That pattern means **a fixed packet-rate ceiling somewhere on the path**: something that can handle only about 372k packets per second and buffers the rest.
+
+Some things are ruled out:
+- **CPU:** the busiest laptop core was 29.8%, and that's the NIC interrupt core (CPU 6, 23% softirq).
+- **The resolvers:** `socket_resolver` and `afxdp_resolver` hit the same number.
+- **Wire speed:** 1 GbE could carry about 1M packets per second at these frame sizes.
+
+That leaves **one of the two NICs or their drivers**: the laptop's I219-LM (`e1000e`) or the client's NIC. Both have a single queue, and consumer chips often top out around this rate.
+
+The client's per-core numbers (2.4% at most) aren't trustworthy. That `mpstat` window probably ended before the load reached full speed, so ignore them.
+
+**Finding out which NIC is the limit (optional, about 5 minutes):**
+
+```bash
+ssh -n $CLIENT 'ethtool -i enp7s0 | head -2'           # client NIC driver
+ethtool -S enp0s31f6 | grep -iE 'rx_(missed|no_buffer|fifo)|tx_(timeout|restart)' > /tmp/b
+ssh -n $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 10 -T 4 -c 8 -q 2000 -Q 2000000' | grep 'per second'
+ethtool -S enp0s31f6 | grep -iE 'rx_(missed|no_buffer|fifo)|tx_(timeout|restart)' | diff /tmp/b - 
+```
+
+- **If the laptop's counters increased**, the laptop NIC is the ceiling.
+- **If nothing changed and the client uses `r8169`** (Realtek), the client NIC is the likely ceiling.
+
+Either way, it goes in the report as a hardware limit, not something your code caused.
+
+**What to do now:** don't spend more time chasing the ceiling. It applies equally to both resolvers, so on this hardware **throughput can't tell them apart, but CPU cost can**. Rerun the benchmark with the updated `benchC` (with `-n` and the single-instance check), unchanged otherwise:
+
+1. **Baseline.** In terminal 1, start `sudo taskset -c 2 ./socket_resolver --local`. In terminal 2, confirm `pgrep -a socket_resolver` shows exactly one process, then run `benchC sockC socket_resolver`. Ctrl-C terminal 1 when done.
+2. **Config C.** In terminal 1, start `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb`. In terminal 2, confirm `pgrep -a afxdp_resolver` shows exactly one, then run `benchC C afxdp_resolver`. Ctrl-C terminal 1 when done.
+3. **Print the summary** with the same loop as before.
+
+The report then compares **resolver CPU at about 372k QPS and at 150k QPS** between the two arms. You'd describe it like this: "on the I219-LM path both resolvers saturate a ~372k pps NIC limit; AF_XDP serves that rate using X% of a core vs Y% for sockets".
+
+That diff identifies the bottleneck, and it's on the laptop.
+
+- **`rx_no_buffer_count` went up by 29,779 in 10 seconds.** The I219-LM's receive ring repeatedly ran out of free descriptors: packets arrived faster than the driver handed buffers back. The NIC held them in its internal buffer instead of dropping them, which is why dnsperf shows 0 lost and only rising latency.
+- **`tx_restart_queue` went up by 79.** The transmit ring filled up and the driver had to pause it.
+
+So the ~372k ceiling is the **laptop's `e1000e` ring and driver path**. The client's `r8169` isn't the limit. It's also why both resolvers top out at the same number: this happens in the driver, before either one sees a packet. For the report, it's a hardware/driver limit of the I219-LM's single queue.
+
+Before the final rerun, one quick check is worth doing, because the default ring may be small:
+
+```bash
+ethtool -g enp0s31f6                                  # "Pre-set maximums" vs "Current hardware settings"
+sudo ethtool -G enp0s31f6 rx 4096 tx 4096             # use the maximums it reports if they differ
+sleep 3; ping -c2 192.168.50.2                        # the NIC resets briefly
+```
+
+Record the ring sizes you end up with in the report. They apply equally to both resolvers, so the comparison stays fair.
+
+## Final rerun
+
+Make sure `benchC` is the latest version (with `-n` and the single-instance check), and that `CLIENT` is set in terminal 2.
+
+**1. Clean start:**
+
+```bash
+sudo pkill -INT -x socket_resolver; sudo pkill -INT -x afxdp_resolver; sleep 2
+pgrep -a 'socket_resolver|afxdp_resolver'             # must print nothing
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+mkdir -p results/old && mv results/sockC_* results/C_* results/old/ 2>/dev/null
+```
+
+**2. Baseline:**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `benchC sockC socket_resolver`
+- When it prints `lat run 3 done`, press Ctrl-C in terminal 1.
+
+**3. Config C:**
+- Terminal 1: `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb`
+- Terminal 2: `benchC C afxdp_resolver`
+- When it prints `lat run 3 done`, press Ctrl-C in terminal 1.
+
+**4. Summary**, with the NIC's busiest core added:
+
+```bash
+for cfg in sockC C; do for t in tput lat; do for f in results/${cfg}_${t}_[0-9].txt; do
+  r=${f##*_}; r=${r%.txt}
+  q=$(awk '/per second/{printf "%.0f",$4}' $f); l=$(awk '/Average Latency/{printf "%.0f",$4*1e6}' $f); lo=$(awk '/Queries lost/{print $3}' $f)
+  c=$(awk '/^Average/{print "usr="$4" sys="$5" cpu="$8}' results/${cfg}_${t}_cpu_$r.txt)
+  x=$( [ $t = tput ] && awk '/^Average/{printf "client_busy=%.1f%%", 100-$NF}' results/${cfg}_client_cpu_$r.txt )
+  h=$( [ $t = tput ] && awk '/Average/ && $2 ~ /^[0-9]+$/ {printf "%.1f %s %s\n", 100-$NF, $2, $8}' results/${cfg}_tput_percpu_$r.txt | sort -rn | head -1 | awk '{printf "hotcore=CPU%s %.0f%% soft=%s", $2, $1, $3}' )
+  s=$( [ $t = lat ] && awk '/^Average/{printf "sys_busy=%.1f%% soft=%s", 100-$NF, $8}' results/${cfg}_lat_sys_$r.txt )
+  echo "$cfg $t r$r qps=$q lat_us=$l lost=$lo $c $x $h $s"
+done; done; done | tee results/summary_C.txt
+```
+
+**5. Clean up** with the step 8 commands from before.
+
+Paste the summary, and I'll put configs A, B and C into the final tables.
+
+ethtool -g enp0s31f6   
+Ring parameters for enp0s31f6:
+Pre-set maximums:
+RX:			4096
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			4096
+TX push buff len:	n/a
+Current hardware settings:
+RX:			256
+RX Mini:		n/a
+RX Jumbo:		n/a
+TX:			256
+RX Buf Len:		n/a
+CQE Size:		n/a
+TX Push:		off
+RX Push:		off
+TX push buff len:	n/a
+TCP data split:		n/a
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ethtool -G enp0s31f6 rx 4096 tx 4096
+[sudo] password for divisht: 
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sleep 3; ping -c2 192.168.50.2   
+PING 192.168.50.2 (192.168.50.2) 56(84) bytes of data.
+64 bytes from 192.168.50.2: icmp_seq=1 ttl=64 time=0.967 ms
+64 bytes from 192.168.50.2: icmp_seq=2 ttl=64 time=0.604 ms
+
+--- 192.168.50.2 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1000ms
+rtt min/avg/max/mdev = 0.604/0.785/0.967/0.181 ms
+
+There are two separate sets of rings, and they have different sizes:
+
+| Ring | Where it lives | Size now | Maximum |
+|---|---|---|---|
+| **NIC descriptor rings** (RX/TX) | Inside the `e1000e` driver; set with `ethtool -G` | **4096** each (you just raised it from 256) | 4096 (the "Pre-set maximums") |
+| **AF_XDP rings** (FILL, RX, TX, COMPLETION) | Between the kernel and `afxdp_resolver`; set in the code | **2048** each (`XSK_RING_*_DEFAULT_NUM_DESCS`) | Any power of two; 4096 works |
+
+They don't depend on each other. A packet first lands in one of the NIC's 4096 descriptors. Generic XDP then copies it into one of your UMEM frames and posts it on the 2048-entry AF_XDP RX ring. The socket resolver never touches the AF_XDP rings, so the NIC-ring change applies to both arms equally, which is what keeps the comparison fair.
+
+Your UMEM is also built around 2048: 4096 frames in total, 2048 pre-filled for receive and 2048 kept in the TX pool.
+
+**Should you raise the AF_XDP rings to 4096?** Probably not. At ~372k packets per second, 2048 entries hold about 5.5 ms of traffic, while your loop drains up to 64 per pass. The counters you saw (`rx_no_buffer_count`) belong to the NIC's ring, not the AF_XDP ring.
+
+Rather than guess, you can check: the kernel keeps drop counters for every AF_XDP socket. To print them on exit, add this just before the final `fprintf` in `afxdp_resolver.c`, the one that prints RX/TX:
+
+```c
+struct xdp_statistics st; socklen_t sl = sizeof(st);
+if (getsockopt(xsk_fd, SOL_XDP, XDP_STATISTICS, &st, &sl) == 0)
+    fprintf(stderr, "xsk stats: rx_dropped=%llu rx_ring_full=%llu fill_empty=%llu tx_invalid=%llu\n",
+            st.rx_dropped, st.rx_ring_full, st.rx_fill_ring_empty_descs, st.tx_invalid_descs);
+```
+
+If `rx_ring_full` and `fill_empty` stay at 0 after a benchmark, the 2048 rings are never the bottleneck. Leave them as they are and mention that in the report.
+
+If either counter is non-zero, raising them is a small change:
+- Set `NUM_FRAMES` to `8192`.
+- Set all four ring sizes in `umem_cfg` and `xsk_cfg` to `4096`, in place of the `XSK_RING_*_DEFAULT_NUM_DESCS` constants.
+
+The code already pre-fills `fill_size` frames and gives the rest to the TX pool, so nothing else needs to change.
+
+The ring increase was the first fix. The data points to a few more, each of which is a one-line change. Make them **one at a time and measure after each**, so you know which one helped. All of them affect both resolvers equally, so the comparison stays fair, but record every setting for the report.
+
+**Step 0: Define a 10-second test** (terminal 2, with `afxdp_resolver --local enp0s31f6 --skb` running in terminal 1):
+
+```bash
+qt(){
+  ethtool -S enp0s31f6 | grep -E 'rx_no_buffer_count|tx_restart_queue|flow_control' > /tmp/b
+  ssh -n $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 10 -T 4 -c 8 -Q 2000000' | grep -E 'per second|Average Latency|lost'
+  ethtool -S enp0s31f6 | grep -E 'rx_no_buffer_count|tx_restart_queue|flow_control' | diff /tmp/b - | grep '^>'
+}
+qt          # result with the 4096 rings only
+```
+
+**Fix 1: Move the NIC's interrupt to its own physical core.** This is the most likely cause. The NIC interrupt ran on **CPU 6**, and the resolver is pinned to **CPU 2**. On a 4-core, 8-thread chip, those are usually the two hyperthreads of the same physical core, so they compete for it. Check:
+
+```bash
+lscpu -e=CPU,CORE | awk 'NR==1 || $1==2 || $1==6'      # same CORE number = same physical core
+```
+
+If they share a core, move the interrupt to a different one:
+
+```bash
+sudo systemctl stop irqbalance                              # otherwise it moves the IRQ back
+IRQ=$(grep enp0s31f6 /proc/interrupts | awk -F: '{print $1}' | tr -d ' ' | head -1); echo "IRQ $IRQ"
+echo 1 | sudo tee /proc/irq/$IRQ/smp_affinity_list          # CPU 1: pick one not on core of CPU 2
+qt
+```
+
+**Fix 2: Turn off Energy-Efficient Ethernet.** EEE lets the link sleep between packets, which adds wake-up delay on every burst:
+
+```bash
+sudo ethtool --show-eee enp0s31f6 | head -3
+sudo ethtool --set-eee enp0s31f6 eee off
+sleep 3; qt
+```
+
+**Fix 3: Tune interrupt moderation.** `e1000e` batches interrupts. Try a few settings, keep the best, and note it:
+
+```bash
+ethtool -c enp0s31f6 | grep rx-usecs
+for u in 0 10 50 100; do echo "== rx-usecs $u"; sudo ethtool -C enp0s31f6 rx-usecs $u; sleep 2; qt; done
+sudo ethtool -C enp0s31f6 rx-usecs <best>
+```
+
+**Fix 4: Check for Ethernet flow control.** Zero loss, a fixed rate and growing latency are also the signature of PAUSE frames: when the laptop's buffers run low, the NIC tells the client to stop sending. If `qt` showed `flow_control`/`xoff` counters rising, that's happening. Turn it off to see what the NIC really sustains:
+
+```bash
+ethtool -a enp0s31f6
+sudo ethtool -A enp0s31f6 rx off tx off
+ssh -n $CLIENT 'sudo ethtool -A enp7s0 rx off tx off'     # may ask for the client's password; run it on the client if so
+sleep 3; qt
+```
+
+With flow control off, overload shows up as `lost` instead of latency. A higher QPS with a few lost queries is the NIC's honest capacity.
+
+**What to expect:** these fixes remove the avoidable overhead, but the I219-LM still has **one receive queue, so all of its packets go through one core's softirq**. Somewhere above the current ~372k, that core runs out, which is the architectural limit, and only a multi-queue NIC (`igb`, `i40e`, `ice`) gets past it. If `qt` still stops at a fixed number with the interrupt core near 100% `soft`, you've reached that limit:
+
+```bash
+mpstat -P 1 5 1 | tail -1
+```
+
+Use the CPU number you chose in Fix 1.
+
+**Then:** run the final `benchC` rerun (sockC, then C) with whatever settings won, and list them in the report: rings 4096, IRQ on CPU 1, EEE off, rx-usecs N, flow control on or off.
+
+**Afterwards, revert** with `sudo systemctl start irqbalance`, `sudo ethtool --set-eee enp0s31f6 eee on`, and `sudo ethtool -A enp0s31f6 rx on tx on`. A reboot also resets all of it.
+
+A few things went wrong at once. Here's what happened and how to get back on track.
+
+**What happened:**
+
+1. **The first `qt` gave 96k QPS, down from 372k.** Changing the ring size makes `e1000e` reset the adapter. The AF_XDP resolver was still bound to the NIC as it was before the reset, and it ran badly afterwards. The fix is to **restart the resolver after any `ethtool -G/-C/-A/--set-eee`**, because each of those can reset the NIC.
+2. **CPU 2 and CPU 6 are the same physical core** (core 2). That confirms the NIC interrupt was competing with the resolver, and moving it to CPU 1 was correct. That `qt` was interrupted (`^C`), so it wasn't measured.
+3. **Turning off EEE reset the link**, and from then on everything got `No route to host`. None of the later tests ran, so the rx-usecs loop and the flow-control change measured nothing.
+4. **`rx-usecs` is now 100**, left over from the last loop iteration. The default is 3, which means adaptive. Also, `<best>` was a placeholder in my instructions, which is what caused the syntax error.
+5. EEE showed `enabled - inactive`: it wasn't active on this link, so it was never the cause.
+
+Do the following in order.
+
+**Step 1: Restore the link.** On the laptop:
+
+```bash
+sudo pkill -INT -x afxdp_resolver; sleep 1
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+sudo ethtool -C enp0s31f6 rx-usecs 3                 # back to default
+sudo ethtool -A enp0s31f6 rx on tx on                # back to default
+ip -br addr show enp0s31f6                           # re-add if 192.168.50.1 is missing:
+sudo ip addr add 192.168.50.1/24 dev enp0s31f6 2>/dev/null
+sudo ethtool enp0s31f6 | grep -E 'Speed|Link detected'
+ping -c3 192.168.50.2
+```
+
+If the ping fails, check the client: `ip -br addr show enp7s0` should still show `192.168.50.2/24`. Add it again if it's gone.
+
+**Step 2: Replace `qt` with a safer version** that checks the link first:
+
+```bash
+qt(){
+  ping -c1 -W1 192.168.50.2 >/dev/null || { echo "LINK DOWN: fix before testing"; return 1; }
+  pgrep -x afxdp_resolver >/dev/null || pgrep -x socket_resolver >/dev/null || { echo "NO RESOLVER RUNNING"; return 1; }
+  ethtool -S enp0s31f6 | grep -E 'rx_no_buffer_count|tx_restart_queue|flow_control' > /tmp/b
+  ssh -n $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 10 -T 4 -c 8 -Q 2000000' | grep -E 'per second|Average Latency|lost'
+  ethtool -S enp0s31f6 | grep -E 'rx_no_buffer_count|tx_restart_queue|flow_control' | diff /tmp/b - | grep '^>'
+}
+```
+
+**Step 3: Pin all of the NIC's interrupts to CPU 1.** The NIC can have several IRQs, and earlier only the first one was moved:
+
+```bash
+for i in $(grep enp0s31f6 /proc/interrupts | awk -F: '{print $1}'); do echo 1 | sudo tee /proc/irq/$i/smp_affinity_list >/dev/null; echo "IRQ $i -> CPU1"; done
+```
+
+**Step 4: Measure the rings plus IRQ fix.** Terminal 1:
+
+```bash
+sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb
+```
+
+Terminal 2: `qt`
+
+**Step 5: Sweep interrupt moderation.** For each value, Ctrl-C the resolver, change the setting, restart the resolver, then measure:
+
+```bash
+sudo ethtool -C enp0s31f6 rx-usecs 0        # then: restart resolver in terminal 1, ping -c1 192.168.50.2, qt
+sudo ethtool -C enp0s31f6 rx-usecs 50       # same
+sudo ethtool -C enp0s31f6 rx-usecs 3        # default, same
+```
+
+Keep whichever value gives the highest QPS.
+
+**Step 6: Flow control, only if `qt` shows `flow_control` counters rising.** Turn it off on both ends, run the client's command on the client itself, then restart the resolver and run `qt`:
+
+```bash
+sudo ethtool -A enp0s31f6 rx off tx off     # laptop
+sudo ethtool -A enp7s0 rx off tx off        # on the Arch client, in its own terminal
+```
+
+Paste the `qt` output from steps 4–6. Then run the final `benchC` rerun with the winning settings, and remember to restart the resolver after the last NIC change.
+
+Yes, the default is **on**. Your earlier `ethtool -a` output showed `Autonegotiate: on, RX: on, TX: on`. Put it back:
+
+```bash
+sudo ethtool -A enp0s31f6 autoneg on rx on tx on
+sleep 3
+ethtool -a enp0s31f6                 # expect Autonegotiate on, RX on, TX on
+ping -c3 192.168.50.2                # this change can reset the link
+```
+
+If the ping fails, re-add the address with `sudo ip addr add 192.168.50.1/24 dev enp0s31f6` and try again.
+
+The client wasn't changed, because that earlier `ssh` command failed with "No route to host". You can confirm on the Arch machine with `ethtool -a enp7s0`; it should also show RX and TX on.
+
+The change may have reset the NIC, so **restart the resolver** before the next test (Ctrl-C in terminal 1, then start it again).
+
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ qt
+qt: command not found
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ qt(){
+  ping -c1 -W1 192.168.50.2 >/dev/null || { echo "LINK DOWN: fix before testing"; return 1; }
+  pgrep -x afxdp_resolver >/dev/null || pgrep -x socket_resolver >/dev/null || { echo "NO RESOLVER RUNNING"; return 1; }
+  ethtool -S enp0s31f6 | grep -E 'rx_no_buffer_count|tx_restart_queue|flow_control' > /tmp/b
+  ssh -n $CLIENT 'dnsperf -s 192.168.50.1 -d payload.txt -l 10 -T 4 -c 8 -Q 2000000' | grep -E 'per second|Average Latency|lost'
+  ethtool -S enp0s31f6 | grep -E 'rx_no_buffer_count|tx_restart_queue|flow_control' | diff /tmp/b - | grep '^>'
+}
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ qt
+  Queries lost:         0 (0.00%)
+  Queries per second:   376359.300663
+  Average Latency (s):  0.000258 (min 0.000083, max 0.003894)
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ethtool -C enp0s31f6 rx-usecs 0        # then: restart resolver in terminal 1, ping -c1 192.168.50.2, qt
+sudo ethtool -C enp0s31f6 rx-usecs 50       # same
+sudo ethtool -C enp0s31f6 rx-usecs 3        # default, same
+[sudo] password for divisht: 
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ethtool -A enp0s31f6 rx off tx off 
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ethtool -A enp0s31f6 rx default tx default
+ethtool (-A): invalid value 'default' for parameter 'rx'
+divisht@divisht-Latitude-5420:~/AF-XDP_DNS-Resolver$ sudo ethtool -A enp0s31f6 rx off tx off sudo ethtool -A enp0s31f6 autoneg on rx on tx on
+sleep 3
+ethtool -a enp0s31f6                 # expect Autonegotiate on, RX on, TX on
+ping -c3 192.168.50.2                # this change can reset the link
+ethtool (-A): unknown parameter 'sudo'
+Pause parameters for enp0s31f6:
+Autonegotiate:	on
+RX:		on
+TX:		on
+RX negotiated: on
+TX negotiated: on
+
+PING 192.168.50.2 (192.168.50.2) 56(84) bytes of data.
+64 bytes from 192.168.50.2: icmp_seq=1 ttl=64 time=0.251 ms
+64 bytes from 192.168.50.2: icmp_seq=2 ttl=64 time=0.223 ms
+64 bytes from 192.168.50.2: icmp_seq=3 ttl=64 time=0.405 ms
+
+--- 192.168.50.2 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2036ms
+rtt min/avg/max/mdev = 0.223/0.293/0.405/0.080 ms
+
+
+
+Here's where things stand. Your combined command failed (it ran two commands on one line), but flow control shows **on** for RX and TX, which is the default, and the link is healthy at a 0.3 ms ping.
+
+**What this `qt` result shows:**
+
+| Setting | QPS | Latency | Laptop NIC counters during run |
+|---|---|---|---|
+| Default (256 rings, IRQ sharing a core with the resolver) | ~372k | 258 µs | `rx_no_buffer` +29,779 |
+| 4096 rings + NIC IRQ moved to CPU 1 | **376k** | 258 µs | **no increase** |
+
+The laptop's counters printed nothing, so **the laptop NIC is no longer short of buffers**. The fixes removed the laptop's problem, but the ceiling didn't move, so the remaining limit is **not on the laptop**. That leaves the client: the Arch machine's Realtek NIC (`r8169`), with its single queue, can't send and receive faster than about 376k packets per second. You can confirm it on the client with:
+
+```bash
+ethtool -S enp7s0 | grep -iE 'miss|drop|err|fifo'    # run before and after a qt, compare
+```
+
+The interrupt-moderation sweep wasn't actually measured: the three commands ran back to back and ended on the default of 3. Since the laptop's counters are now clean, it wouldn't change anything, so skip it.
+
+**Conclusion for the report:** on the cabled setup, throughput is capped at **~376k QPS by the client NIC** (Realtek `r8169`, single queue) once the server side is tuned (4096 rings, NIC IRQ off the resolver's core). Both resolvers hit that cap, so config C compares **CPU cost per query**, not maximum throughput.
+
+## Final run with the current settings
+
+The current settings are: rings 4096, NIC IRQ on CPU 1, `rx-usecs` 3, flow control on, EEE off (it was inactive anyway).
+
+**1.** In terminal 1, Ctrl-C the running resolver, then:
+
+```bash
+pgrep -a 'socket_resolver|afxdp_resolver'      # must print nothing
+sudo ip link set enp0s31f6 xdpgeneric off 2>/dev/null
+mkdir -p results/old && mv results/sockC_* results/C_* results/old/ 2>/dev/null
+```
+
+**2. Baseline:**
+- Terminal 1: `sudo taskset -c 2 ./socket_resolver --local`
+- Terminal 2: `benchC sockC socket_resolver`
+- When it's done, Ctrl-C terminal 1.
+
+**3. Config C:**
+- Terminal 1: `sudo taskset -c 2 ./afxdp_resolver --local enp0s31f6 --skb`
+- Terminal 2: `ping -c1 192.168.50.2 && benchC C afxdp_resolver`
+- When it's done, Ctrl-C terminal 1.
+
+**4. Summary:** run the summary loop from before (the one with `hotcore`) and paste it here.
+
+`benchC` and `CLIENT` must be defined in terminal 2. If you opened a new terminal, re-paste the `benchC` definition and run `export CLIENT=devarshi@192.168.50.2` first.
+
+
+
+Replacing only afxdp_resolver.c won’t work. The new file calls the shared engine in resolver.c, so the build fails without it. And if you added the engine but kept your current socket_resolver.c (the original, with its own built-in copy of the old logic), the two arms would resolve differently. The socket arm would still have the CNAME and NODATA bugs, and the comparison would no longer be fair. The four source files go together.
+Changes before you push
+
+1. Source files, from afxdp_resolver_final.tgz:
+File	Action
+resolver.c, resolver.h	add (shared iterative engine)
+afxdp_resolver.c	replace
+socket_resolver.c	replace too (now a 101-line front-end)
+mock_dns.py, mock_net.sh, test_matrix.sh	add (offline recursion tests)
+
+2. Makefile. Both resolvers must link resolver.c. In all four resolver rules (the normal and _asan targets), add resolver.c resolver.h to the dependencies and resolver.c to the compile line:
+make
+
+socket_resolver: socket_resolver.c resolver.c resolver.h dns.c dns.h
+	$(CC) $(CFLAGS) -o $@ socket_resolver.c resolver.c dns.c $(LDFLAGS)
+afxdp_resolver: afxdp_resolver.c resolver.c resolver.h dns.c dns.h
+	$(CC) $(CFLAGS) -o $@ afxdp_resolver.c resolver.c dns.c $(XDP_LIBS)
+
+3. Delete stray files. addr, check, daddr, dest, ihl, len, options, saddr, source and ttl are empty files, almost certainly created by pasting C lines into the shell. A line like ip->saddr = … makes bash create a file named saddr through > redirection. They’re untracked, so remove them with rm addr check daddr dest ihl len options saddr source ttl.
+
+4. results/. It’s untracked, and you need to decide what to do with it. I’d commit the three summary*.txt files (that’s your evidence), store the raw files as a single archive (tar czf results_raw.tgz results/), and add results/old/ to .gitignore.
+
+5. .gitignore. Add mock_dns.log and results/old/.
+
+6. README corrections:
+
+    It says afxdp_resolver “requires an explicit --skb or --drv flag — there is no default”. That’s wrong: with neither flag, the kernel chooses. Either reword it, or make the flag mandatory in the code.
+    The Files table lists recursive_resolver.c, which is already gone. Add resolver.c/h and the mock scripts.
+    Status: mark “AF_XDP recursive mode” as done, and add the recursive-mode usage and test_matrix.sh steps.
+    Note that the benchmark numbers came from the previous build, and that the refactor was regression-tested in --local mode with equal throughput.
+
+7. A correction to what I said last time: the argument order did not change. The parser accepts flags in any position, so the README’s sudo ./afxdp_resolver --local --skb <interface> still works.
+
+8. Before pushing:
+
+    Run make clean && make.
+    Do a quick --local check with dig.
+    Run test_matrix.sh against both resolvers with mock_net.sh up.
+    Commit testbed.sh’s permission change (it now shows as M) so the next clone doesn’t hit “command not found”.
+
+The whole flow
+
+                         client: dig / dnsperf (RD=1, "resolve this for me")
+                                        │
+                                        ▼
+  NIC driver ──► XDP hook ──► xdp_kern.o (eBPF policy, loaded by afxdp_resolver)
+                                │
+          ┌─────────────────────┴──────────────────────┐
+  UDP dst port 53                              anything else (ARP, SSH, ping,
+  → bpf_redirect_map(XSKMAP)                    upstream DNS *replies*…)
+          │                                     → XDP_PASS
+          ▼                                             ▼
+  AF_XDP socket: UMEM frame on RX ring          Linux network stack (IP/UDP/socket)
+  (stack bypassed)                              (socket_resolver's path when no
+          │                                      XDP program is attached)
+          └──────────────────┬─────────────────────────┘
+                             ▼
+              resolver.c: one shared engine (same code for both paths)
+                validate → NOTIMP if not A/AAAA → cache (follows cached CNAMEs)
+                             │ miss
+                             ▼
+              ITERATIVE RESOLUTION (RD=0, ordinary UDP socket, ephemeral port)
+                root (1 of 13) ──referral + glue──► TLD ──referral──► authoritative
+                   • CNAME  → follow the chain, restarting from root if it crosses zones
+                   • glueless referral → child query resolves the NS name first
+                   • NXDOMAIN / NODATA → negative-cached (SOA TTL)
+                   • per-hop 1 s timeout → next nameserver; 5 s overall → SERVFAIL
+                   • replies checked: port 53, server IP, TXID, question
+                             │
+                             ▼
+              answer (with CNAME chain) → cache → reply on the SAME path it came in:
+                AF_XDP: headers swapped into a free UMEM frame → TX ring → NIC
+                socket: sendto() → kernel stack → NIC
+
+Five points to make in the report:
+
+    The eBPF program is the externalised policy. xdp_kern.c alone decides, per packet and before the kernel allocates anything, whether traffic takes the AF_XDP fast path or the normal stack. The rule is currently “UDP destination port 53”, but it could match on source subnet, port or anything else in the headers without touching the resolver.
+    Recursive service to the client, iterative resolution upstream. The client asks once, and the resolver walks the hierarchy itself. It never forwards to another resolver.
+    Upstream traffic deliberately stays on the kernel stack. Replies from the root, TLD and authoritative servers arrive on an ephemeral port, so the XDP program passes them to the stack, and ARP and routing keep working without extra code.
+    Only the client-facing I/O differs between the two arms. Both binaries link the same resolver.c and dns.c, so any difference in throughput or CPU comes from the packet path alone.
+    Copy mode only. Zero-copy needs a ZC-capable NIC, so it’s future work.
+
+I can make the Makefile, README and .gitignore changes and package them with the source files, so the push is a single copy.
+
+I haven’t committed or pushed anything, and I’d rather not do it unasked. A tool check flagged uncommitted changes, but they’re in my copy of the zip you sent, not anything I wrote:
+
+    Where it would go: this copy’s remote is Ankit-matrix/AF-XDP_DNS-Resolver on main. Pushing would write straight to your team’s shared branch.
+    What’s uncommitted: the testbed.sh permission change, the ten empty stray files (addr, saddr, ttl, …) and the untracked results/ folder. Committing as-is would put the junk files in the repo.
+    What it would leave out: the new source files (resolver.c/h, both front-ends, the mock scripts) aren’t in this copy, so a push now wouldn’t include the work you’re actually preparing.
+
+You also said you wanted to push yourself after making the changes.
+
+If you’d like me to do it instead, I can work on a branch in this copy:
+
+    Delete the stray files.
+    Add the four source files and the mock scripts.
+    Update the Makefile, README and .gitignore.
+    Commit the summary results.
+    Build it and run the test matrix.
+    Push the branch for you to merge, rather than pushing to main.
+
+The push only works if this session has write access to that GitHub repo. Tell me to go ahead, or say if you’d prefer it pushed directly to main.
+
+how did socket resolver shorten so much
+
+Nothing was deleted. The resolution logic was moved out of socket_resolver.c into the shared resolver.c, so it’s no longer duplicated. Here’s where the original 640 lines went:
+Part of the old socket_resolver.c	Old lines	Where it is now
+Header comment, config constants	1–45	Mostly resolver.c; the port and epoll constants stay
+Root server list, rand_txid, now_ms	47–72	resolver.c
+TTL cache (hash table, lookup, insert, eviction)	74–170	resolver.c
+Pending-query table	172–216	resolver.c
+Resolution engine: send_to_ns, start_resolution, handle_ns_response (referrals, glue, CNAME, NXDOMAIN)	218–438	resolver.c, rewritten with the bug fixes
+check_timeouts	440–464	resolver.c → resolver_tick()
+main(): sockets, epoll, plus inline validation, NOTIMP, --local answers, cache-hit replies, upstream parsing	466–640	Sockets and epoll stay; everything else moved to resolver_handle_query() / resolver_handle_upstream()
+
+What’s left in socket_resolver.c is only what’s specific to sockets:
+
+    Socket setup: create the client socket, bind 0.0.0.0:53, set up epoll.
+    Receive: recvfrom() a query, then hand it to resolver_handle_query(buf, len, &client_addr).
+    Reply callback: sock_reply(), which is a single sendto() to the saved client address.
+    Upstream and timers: when the upstream socket is readable, call resolver_handle_upstream(); call resolver_tick() every 100 ms.
+
+afxdp_resolver.c has the same four pieces, implemented with UMEM, the RX/TX rings and frame building instead of recvfrom/sendto.
+
+The total code actually grew: the shared resolver.c is 716 lines, compared with about 520 lines of engine in the old file. The extra lines are the new features: glueless delegation, the CNAME chain in replies, NODATA, negative-cache TTLs and the response-validation checks. Each feature now exists once, and both binaries get it.
+
+That’s also the strongest argument for this design in the report. The comparison is fair by construction, because both arms run the identical compiled engine and only the roughly 100 lines of client I/O differ.
+
+.sh files testing (offline integration) cmds now
+
+
+
+These are the offline integration test commands for the laptop. Run them from the repo folder, with the new files from afxdp_resolver_final.tgz already copied in.
+
+Step 1: One-time preparation:
+
+bash
+cd ~/AF-XDP_DNS-Resolver
+sudo apt install -y python3-dnspython dnsutils
+chmod +x testbed.sh mock_net.sh test_matrix.sh
+clang -O2 -g -target bpf -I/usr/include/$(uname -m)-linux-gnu -c xdp_kern.c -o xdp_kern.o
+gcc -O3 -Wall -Wextra -o socket_resolver socket_resolver.c resolver.c dns.c
+gcc -O3 -Wall -Wextra -o afxdp_resolver  afxdp_resolver.c  resolver.c dns.c -lxdp -lbpf
+
+Install dnspython with apt, not pip --user: mock_net.sh starts Python with -I, which hides packages installed with --user.
+
+Step 2: Clean start:
+
+bash
+sudo pkill -x socket_resolver; sudo pkill -x afxdp_resolver
+sudo ./mock_net.sh down; sudo ./testbed.sh teardown
+pgrep -a '_resolver'                          # must print nothing
+
+Step 3: Bring up the test network and the mock hierarchy:
+
+bash
+sudo ./testbed.sh setup                       # client namespace "dnstest" ↔ veth-dns 10.0.0.1
+sudo ./mock_net.sh up                         # expect "mock DNS hierarchy up"
+dig +norec @198.41.0.4 com NS | grep -A1 AUTHORITY    # mock root answers with a referral
+
+Step 4: Test the socket resolver, recursive mode.
+
+Terminal 1: sudo ./socket_resolver
+Terminal 2: sudo ./test_matrix.sh (expect == 23 passed, 0 failed)
+Ctrl-C in terminal 1.
+
+Step 5: Test the AF_XDP resolver in generic mode.
+
+Terminal 1: sudo ./afxdp_resolver veth-dns --skb
+Terminal 2: sudo ./test_matrix.sh (expect 23 passed)
+Ctrl-C in terminal 1. Its last lines should show RX=23 TX=23 and rx_ring_full=0 fill_empty=0.
+
+Step 6: Test the AF_XDP resolver in native mode. Same as step 5, with sudo ./afxdp_resolver veth-dns --drv in terminal 1.
+
+Step 7: Check that --local mode still works (no recursion involved):
+
+bash
+sudo ./afxdp_resolver veth-dns --local --skb                              # terminal 1
+sudo ip netns exec dnstest dig @10.0.0.1 github.com A +short              # terminal 2 → 140.82.121.3
+sudo ip netns exec dnstest python3 malformed.py 10.0.0.1 53               # 7 dropped, control answered
+
+Step 8: Optional load test, with uncached recursive queries:
+
+bash
+python3 -c "
+import random; n=[f'r{i}.nope.google.com A' for i in range(4000)]+['google.com A','www.github.com A','mail.google.com A','www.glueless.com A','github.com AAAA']*200
+random.shuffle(n); open('rec_payload.txt','w').write('\n'.join(n)+'\n')"
+sudo ip netns exec dnstest dnsperf -s 10.0.0.1 -d rec_payload.txt -n 1 -Q 1000 -c 8 | grep -E 'completed|lost|NOERROR'
+
+Run it against each resolver while that resolver runs in terminal 1. Expect 5000 completed, 0 lost, NOERROR 1000 and NXDOMAIN 4000.
+
+Step 9: Tear down. Always do this, because the mock takes over the root-server addresses while it’s up:
+
+bash
+sudo ./mock_net.sh down
+sudo ./testbed.sh teardown
+ip route | grep -E '198.41.0.4|192.5.6.30' || echo "routes clean"
+
+If something fails:
+
+Symptom	Fix
+Every case shows none	The client namespace is missing. Run sudo ./testbed.sh setup.
+Every case shows SERVFAIL	Check the mock: cat mock_dns.log should show queries arriving. If not, run sudo ./mock_net.sh down && sudo ./mock_net.sh up.
+bind: Address already in use	A leftover resolver is running: sudo pkill -x socket_resolver.
+xsk_socket__create: Device or resource busy	A leftover AF_XDP resolver: sudo pkill -x afxdp_resolver; sudo ip link set veth-dns xdp off.
+mock_net.sh up says File exists	It’s already partly up. Run down first.
+ModuleNotFoundError: dns in mock_dns.log	Run sudo apt install python3-dnspython.
+
+Only the www.dead.com case is expected to take about 1 second; it tests the timeout. Every other case should answer in a few milliseconds.
+
+For the headline --local benchmark, no. Keep payload.txt as it is. All the numbers you’ve already recorded (configs A, B and C, and the I219 runs) used it. Changing it now would mean redoing every benchmark, and it wouldn’t change what the benchmark measures: in --local mode each query costs the same whatever the name.
+
+What’s worth adding is separate query lists for other purposes, kept alongside the original:
+
+File	Contents	Purpose
+payload.txt (keep)	8 local-zone A names	Headline throughput/CPU benchmark; matches all recorded results
+payload_mixed.txt (optional)	Local names + unknown names + TXT/MX	--local with all the reply paths exercised (NOERROR, NXDOMAIN, NOTIMP), showing both arms handle every code path at speed
+payload_recursive_mock.txt (recommended)	The 4,000 unique rN.nope.google.com names + the CNAME/glueless names	Load test of recursive mode against mock_dns.py; this is the file I generated during testing, and it should live in the repo so the test can be repeated
+payload_live.txt (optional)	50–100 real popular domains	Functional check of recursion against the real Internet. Not a benchmark: Internet round trips dominate, and results depend on the network and the time of day
+
+One thing to know if you make a mixed list. The local zone only has A records, so an AAAA query for github.com in --local mode returns NXDOMAIN, not an empty NOERROR as a real server would. That’s fine for benchmarking, but don’t put AAAA queries in a --local list and treat the results as correct DNS behaviour.
+
+I’d do only the recommended one, adding payload_recursive_mock.txt with a one-line note in the README. The other two are optional.
+
+generate payload_recursive_mock.txt for 4000
+
+I’ve generated payload_recursive_mock.txt, and it’s byte-for-byte the same as the list I used in the recursive load test, which passed on both resolvers with 0 lost. It has 5,000 queries in a fixed shuffled order:
+
+Lines	Queries	What each one tests
+4,000	r0.nope.google.com A … r3999.nope.google.com A (all different)	Never cached, so each one makes the resolver walk root → TLD → authoritative and get NXDOMAIN. This exercises the in-flight query table and the upstream path
+200	google.com A	Plain answer
+200	www.github.com A	CNAME chain within one zone
+200	mail.google.com A	CNAME into a different zone
+200	www.glueless.com A	Referral without glue
+200	github.com AAAA	Name exists but has no AAAA (NODATA)
+
+The repeated names are answered from the cache after their first lookup, so the run mixes cold and cached queries.
+
+How to run it (testbed and mock up, a resolver running in recursive mode):
+
+bash
+sudo ./testbed.sh setup && sudo ./mock_net.sh up
+sudo ./afxdp_resolver veth-dns --skb                 # terminal 1 (or: sudo ./socket_resolver)
+sudo ip netns exec dnstest dnsperf -s 10.0.0.1 -d payload_recursive_mock.txt -n 1 -Q 1000 -c 8 \
+    | grep -E 'completed|lost|Response codes|Average Latency'
+
+-n 1 sends the list once, and -Q 1000 caps the rate at 1,000 queries per second. The expected result is Queries completed: 5000 (100.00%), lost 0, NOERROR 1000, NXDOMAIN 4000.
+
+Run it a second time without restarting the resolver, and all 5,000 come from the cache, so latency drops sharply. That’s a nice cache demonstration for the report.
+
+Use it only against the mock hierarchy. Against the live Internet, rN.nope.google.com would send 4,000 junk queries to Google’s real nameservers.
+
+Payload recursive mock
+TXT
+AF-XDP_DNS-Resolver.zip
+ZIP
+
+final build hope it's clean - give me 5000 payload testing cmd for this
+
+I’ll check the build for cleanliness first, then actually run the 5,000-query test on it so the commands I give you are verified.
+
+The code is exactly the tested version. Now I’ll run the full flow in your new layout (build in src/, test scripts in local_offline_testing/) to confirm the paths work:
+
+The code itself is clean. I ran the whole flow in your new layout, and every check passed on all three resolver configurations:
+
+Resolver	Test matrix	5,000 queries, cold cache	5,000 queries, warm cache
+socket_resolver	23/23	5000/5000, 0 lost, avg 1.76 ms	0 lost, avg 0.12 ms
+afxdp_resolver --skb	23/23	5000/5000, 0 lost, avg 2.48 ms	0 lost, avg 0.11 ms
+afxdp_resolver --drv	23/23	5000/5000, 0 lost, avg 1.67 ms	0 lost, avg 0.19 ms
+
+Every run returned NOERROR 1000 and NXDOMAIN 4000. AF_XDP showed RX=10023 TX=10023 with all its kernel drop counters at 0. make builds with no warnings, and the source files match the tested versions exactly. There are no stray files or binaries.
+
+The 5,000-query test
+
+Build in src/ and run the resolver from there, because afxdp_resolver loads xdp_kern.o from the folder you start it in. Run the test scripts from local_offline_testing/.
+
+bash
+# 1. Build
+cd ~/AF-XDP_DNS-Resolver/src
+make clean && make
+
+# 2. Test network + mock hierarchy
+cd ../local_offline_testing
+sudo ./testbed.sh teardown; sudo ./mock_net.sh down       # clean start
+sudo ./testbed.sh setup
+sudo ./mock_net.sh up                                      # → "mock DNS hierarchy up"
+
+# 3. Terminal 1: one resolver (run from src/)
+cd ~/AF-XDP_DNS-Resolver/src
+sudo ./afxdp_resolver veth-dns --skb                       # or: --drv   or: sudo ./socket_resolver
+
+# 4. Terminal 2: functional matrix, then the 5,000-query load (cold cache first, then cached)
+cd ~/AF-XDP_DNS-Resolver/local_offline_testing
+sudo ./test_matrix.sh                                      # → 23 passed, 0 failed
+sudo ip netns exec dnstest dnsperf -s 10.0.0.1 -d payload_recursive_mock.txt -n 1 -Q 1000 -c 8 \
+  | grep -E 'completed|lost|Response codes|Average Latency'
+sudo ip netns exec dnstest dnsperf -s 10.0.0.1 -d payload_recursive_mock.txt -n 1 -Q 1000 -c 8 \
+  | grep -E 'completed|lost|Response codes|Average Latency'
+
+# 5. Ctrl-C terminal 1 (wait for the "RX=… TX=…" line), then repeat 3–4 for the next resolver
+
+# 6. Tear down when finished
+sudo ./mock_net.sh down && sudo ./testbed.sh teardown
+
+Expected for each resolver: Queries completed: 5000 (100.00%), Queries lost: 0, NOERROR 1000 (20.00%), NXDOMAIN 4000 (80.00%). The second (cached) run should show a much lower average latency.
+
+Tidy-up before pushing
+README.md is still the old version. It doesn’t mention src/ or local_offline_testing/, and its Status section still lists recursive mode as not done. It still lists recursive_resolver.c, and it repeats the incorrect claim that --skb/--drv is required (with neither flag, the kernel chooses). It also has no instructions for the offline tests. The reviewer will read this file first.
+results_/README.md uses the folder names from my script (i219/final, pre_tuning_superseded), but you renamed them to i219(nic)/final and pre_modification. Update the names in lines 12–14 and 35.
+Rename i219(nic) to i219_nic and results_ to results. Parentheses in a folder name have to be quoted in every shell command, and the trailing underscore looks unfinished.
+payload.txt now lives at results_/payload_load.txt. It’s a benchmark input, not a result, and testbed.sh and the README still refer to payload.txt. I’d move it to local_offline_testing/payload_local.txt and update both references.
+Add mock_dns.log to .gitignore. mock_net.sh creates it in local_offline_testing/ every time it runs.
+Commit with git add -A. Git currently sees the old top-level files as deleted and the new folders as untracked. git add -A records the move. Then commit and push.
+
+I can rewrite README.md to match the final layout, flow and results, if you’d like.
+
+make the gitignore
+
+I’ll check the exact names in the results tree so both READMEs match what’s on disk.
+
+Both READMEs will use your current folder names, including results_/ and i219(nic)/, so every command works as the repo is today. Paths containing parentheses are quoted.
+
+I’ve written both READMEs, and every path, file name and make target they mention matches your repo exactly. I checked them all against your final build.
+
+README.md (project, ~170 lines):
+
+    Architecture: the packet-flow diagram (XDP policy → AF_XDP or kernel stack → shared engine → iterative root/TLD/authoritative walk) and a layer table showing which file does what.
+    Repository layout: what’s in src/, local_offline_testing/ and results_/.
+    Build: packages, make, the ASan targets.
+    Running: usage for both resolvers and the flags (--local, --skb, --drv).
+    Testing: testbed and mock setup, the xsk_rx_test receive check, the 23-check matrix, the 5,000-query load, the malformed suite and teardown. Each step says which folder to run it from.
+    Benchmarking: the core taskset + dnsperf + pidstat commands, using ../results_/payload_load.txt.
+    Results: a three-row summary that links to the results README.
+    Limitations.
+
+results_/README.md (~100 lines):
+
+    Method: hardware, CPU pinning, run counts, the exclusion rule, and the NIC-tuning commands for the I219 runs.
+    Tables: maximum throughput, and latency/CPU at an equal 150k load, for all five configurations.
+    Six observations, including the client-NIC bottleneck evidence and why generic beat native on veth.
+    Layout and file index: what every file in each configuration folder contains, and which runs were excluded and why.
+
+To install, from the repo root:
+bash
+
+cd ~/AF-XDP_DNS-Resolver
+tar xzf ~/Downloads/readmes.tgz      # overwrites README.md and results_/README.md
+git add -A && git commit -m "Update READMEs for final layout and results" && git push
+
+They use your current folder names results_/ and i219(nic)/. If you rename those (to results/ and i219_nic/, say), run grep -rn 'results_\|i219(nic)' README.md results_/README.md to find every place that needs updating.
+Readmes
+TGZ
+
+so we still have asan ubsan?
+Checking the sanitizer build targets in the Makefile.
+Checking the sanitizer build targets in the Makefile.
+
+Yes. The ASan/UBSan builds are still there as optional Makefile targets. A plain make doesn’t build them; you build them explicitly:
+bash
+
+cd src
+make socket_resolver_asan afxdp_resolver_asan
+
+They use -g -O1 -fsanitize=address,undefined -fno-sanitize=alignment:
+
+    AddressSanitizer catches out-of-bounds reads and writes, use-after-free and similar memory errors.
+    UndefinedBehaviorSanitizer catches things like integer overflow and invalid shifts.
+    Alignment checking is switched off, because the IP header sits at byte 14 of every Ethernet frame. UBSan would flag that on every packet, but it’s normal for packet code and harmless on x86.
+
+They’re for correctness testing, not benchmarking. ASan makes the program several times slower, so all the performance numbers come from the normal -O3 builds. During testing, the ASan builds of both resolvers passed with 0 sanitizer errors:
+
+    the 23-check matrix (recursive mode, through both the socket and AF_XDP paths);
+    the 5,000-query recursive load;
+    the malformed-packet suite.
+
+To use them, run the same tests with the _asan binary, then check its output:
+bash
+
+sudo ./afxdp_resolver_asan veth-dns --skb 2>&1 | tee asan.log    # terminal 1, from src/
+# terminal 2: run test_matrix.sh, the 5,000-query dnsperf, malformed.py as usual
+grep -cE 'AddressSanitizer|runtime error' asan.log               # 0 = clean
+
+The ASan binaries and asan.log are covered by your .gitignore (src/*_asan and *.log), so they won’t be committed.
+Project_Report_AF_XDP_DNS_Resolver.docx
+Project_Report_AF_XDP_DNS_Resolver.docx
+DOCX
+
+make the project report now as per the final build at https://github.com/Ankit-matrix/AF-XDP_DNS-Resolver and make sure to keep the language simple and understandable - the design be slowly build on in the report - architectural choices like why not zero copy and the actual implementation adn reproductiblity as specified - go by sections and make sure to be consistent with the build, make a docx file , ALSO MAKE SURE ALL THE TERMINAL COMMANDS AND OUTPUTS WE GOT DURING THE FINAL ACTUAL TESTING AS WELL AS MOCK TESTING AS SHOWN CONSISTENT WITH GOOD OVERVIEW OF DATA RESULTS AS WELL (some code not a lot but all the most important commands and good backing by data is al i mean)
+Gathering results, test outputs and terminal data for the report
+
+I’ll start by reading your attached report and checking the GitHub repo, so the report matches the final build exactly.
+Created a file, shared a file, and 45 more steps
+
+The report is done and follows your template’s layout: two columns, 10 pt Times New Roman, US Letter. The body runs about 6.5 pages, inside the 10-page limit, and the references and appendices follow it. Every number in it was recomputed from the raw files in code/results/, and the commands use the repository’s real layout (code/src, code/local_offline_testing, payload_local.txt).
+
+How it’s organised:
+
+    Architecture builds the design up one step at a time: socket resolver, then engine/I-O split, XDP steering, the AF_XDP socket, and finally keeping upstream traffic on the kernel stack.
+    “Why not zero-copy?” gets its own paragraph, followed by a table of the other design choices.
+    Implementation has short pseudocode for the AF_XDP loop and the iterative resolution, and four problems found and fixed. These include the -O3 checksum bug, with the tcpdump line that exposed it.
+    Evaluation gives the functional results, the veth results, and the physical-NIC investigation in the order it happened: the -q sweep, the NIC buffer counters, the tuning, then the client requeues.
+    Reproducibility has the exact commands to rebuild every table.
+    Data: 7 tables, 3 figures (architecture, throughput, CPU per query), and about 15 verbatim terminal outputs.
+
+Things you need to fill in or decide:
+
+    Names and roll numbers (title block and Appendix A), the tasks and ratings in Appendix A, and <CPU model>, <RAM> in Table III. I left these as placeholders rather than guess.
+    The mock-hierarchy test outputs (the 23-check matrix, the hop trace and the 5,000-query table) come from my run of the final build in a development VM, and the report says so. All the physical-NIC, veth and benchmark outputs are yours, from the laptop and the Arch machine. If you’d rather show laptop outputs throughout, run test_matrix.sh and the 5,000-query test there, and I’ll swap the outputs in.
+    Section numbering: your template numbered the sections I, II, III, V… and used IX twice. I numbered them I–IX in order; all the mandatory sections are present.
+    Appendix B lists Claude for the code review, the refactor, the test scripts, the bottleneck diagnosis and drafting this report. Add any other tools the team used.
+    The template says prompt logs go in an AI Prompts folder in the repo, but that folder doesn’t exist in the repo yet.
+
+Repo issues to fix: the README still shows the old paths (src/, results_/, payload_load.txt). Also, the .gitignore patterns don’t match the new code/ prefix. Because of that, mock_dns.log is committed, and build outputs in code/src/ would be too. Changing src/ to code/src/ and local_offline_testing/ to code/local_offline_testing/ in .gitignore fixes it.
+
+I checked each reference exists before citing it:
+
+    The eXpress Data Path, CoNEXT ‘18
+    Linux kernel AF_XDP documentation
+    The Path to DPDK Speeds for AF_XDP, LPC 2018
+    DNS-OARC dnsperf
+
+Project report af xdp dns resolver

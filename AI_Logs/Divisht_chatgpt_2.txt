@@ -1,0 +1,3288 @@
+what does it mean to have a recursive query for an iterative resolver
+Good question. This is where the distinction between RD (Recursion Desired) and recursive vs iterative resolution becomes important.
+
+A DNS query can request recursion even if the server receiving it does not support recursion.
+
+1. What does a recursive query mean?
+A recursive query means:
+
+I want you to take responsibility for resolving this domain completely. Don't just give me a referral to another nameserver.
+
+This is communicated using the RD bit in the DNS header.
+
+RD = 1  → Recursion Desired
+RD = 0  → Recursion not requested
+2. What if an iterative resolver receives RD = 1?
+Suppose your resolver receives:
+
+QNAME = www.google.com
+QTYPE = A
+RD = 1
+But your resolver only implements iterative resolution.
+
+It has two possibilities:
+
+Option A: It doesn't support recursion.
+
+It cannot promise to resolve the domain completely.
+
+It can return a referral or an error, depending on its implementation and policy.
+
+It should not claim recursion is available (RA=0).
+
+Option B: It supports recursion.
+
+It takes responsibility for resolving the domain.
+
+It queries root, TLD and authoritative servers itself.
+
+It returns the final answer.
+
+3. Important distinction: RD vs RA
+Bit
+
+Set by
+
+Meaning
+
+RD
+
+Client
+
+Please perform recursive resolution
+
+RA
+
+Server
+
+I support recursive resolution
+
+Think of it like this:
+
+RD = 1: The client is requesting a service.
+
+RA = 1: The server advertises that it can provide that service.
+
+Requesting recursion does not force a server to perform recursion.
+
+4. What should you implement in your C project?
+If you're building a recursive resolver, your client-facing query handler should:
+
+Parse the incoming RD bit.
+
+If recursion is requested and supported, resolve iteratively on behalf of the client.
+
+Return the final answer.
+
+Set RA = 1 to indicate recursion is available.
+
+Preserve the transaction ID and appropriately construct the response.
+
+One final subtlety: An iterative resolver can receive RD=1 and still perform iterative resolution or return a referral. The RD bit describes what the client wants, not what the server is forced to do.
+
+The takeaway: RD describes the request; RA describes the server's capability.
+
+so only some name servers would have our ip address
+Yes, but let's distinguish two things.
+
+1. Which nameservers know our resolver's IP?
+
+When your recursive resolver sends queries to root, TLD and authoritative nameservers, those servers see the source IP address of your resolver.
+
+For example:
+
+Your machine
+    |
+    | Query (RD=1)
+    v
+Your recursive resolver (IP: 10.0.0.5)
+    |
+    | Query (RD=0)
+    v
+Root server
+    |
+    | Referral
+    v
+.com TLD server
+    |
+    | Referral
+    v
+Google authoritative server
+All three servers receive queries originating from your recursive resolver, so they can see its source IP (subject to NAT, forwarding and network infrastructure).
+
+2. Do all nameservers store our IP address?
+
+No!
+
+Root servers don't need to store your resolver's IP.
+
+TLD servers don't need to store your resolver's IP.
+
+Authoritative servers don't need to store your resolver's IP.
+
+They simply receive DNS packets and see their source IP.
+
+3. What about caching?
+
+DNS caching is different. Nameservers generally cache DNS records (like A, AAAA, NS), not a permanent list of all resolvers that queried them.
+
+One interesting exception: DNS servers can maintain logs, rate-limit clients based on IP, or use other operational tracking mechanisms.
+
+Key takeaway: Nameservers don't need to know your IP beforehand. They learn the source IP when they receive your DNS query.
+
+i mean do we iterate through multiple ns1 ns2 .. so on
+Yes! A domain can have multiple authoritative nameservers (ns1, ns2, ns3, etc.), and your resolver can try different ones.
+
+For example, the .com TLD might return:
+
+google.com.  IN  NS  ns1.google.com.
+google.com.  IN  NS  ns2.google.com.
+google.com.  IN  NS  ns3.google.com.
+And the Additional section might contain their glue IP addresses.
+
+How does your resolver handle them?
+Suppose you have:
+
+ns1.google.com → 216.239.x.1
+ns2.google.com → 216.239.x.2
+ns3.google.com → 216.239.x.3
+Your resolver can:
+
+Choose ns1 and send the query.
+
+If it responds successfully, process the response.
+
+If it times out or is unreachable, try ns2.
+
+If ns2 also fails, try ns3.
+
+Nameserver failover
+
+Original query: www.google.com A
+
+ns1 — 216.239.x.1
+
+Timeout
+ns2 — 216.239.x.2
+
+Timeout
+ns3 — 216.239.x.3
+
+Response received
+Important: Do we always try all nameservers?
+No.
+
+If ns1 gives a valid answer, you don't need to query ns2 and ns3.
+
+If ns1 times out, try another.
+
+If ns1 returns another referral, follow that referral rather than treating it as a failure.
+
+If it returns a valid negative answer (e.g. NXDOMAIN), don't automatically assume another nameserver will give a different answer.
+
+For your C resolver
+A useful structure would be:
+
+for (int i = 0; i < ns_count; i++) {
+
+    response = query_nameserver(ns_ip[i], original_query);
+
+    if (response_received(response)) {
+        if (is_valid_response(response)) {
+            process_response(response);
+            break;
+        }
+    }
+
+    // Timeout or unusable server:
+    // Try the next nameserver.
+}
+
+In a robust resolver, also implement timeouts, retries, server selection and handling of referrals.
+
+Remember: Multiple NS records provide redundancy and availability. You generally need just one working authoritative nameserver to obtain the answer.
+
+so until we get additional section in ip of google.com we go on
+
+Usually, no. In the example we're discussing, the Additional section contains the IP addresses of the nameservers, not the website.
+
+Let's compare:
+
+Response from `.com` TLD server:
+
+```
+AUTHORITY SECTION:
+google.com. IN NS ns1.google.com.
+google.com. IN NS ns2.google.com.
+
+ADDITIONAL SECTION:
+ns1.google.com. IN A <NS_IP_1>
+ns2.google.com. IN A <NS_IP_2>
+```
+
+These are nameserver IPs (glue records).
+
+Response from Google's authoritative server:
+
+```
+ANSWER SECTION:
+www.google.com. IN A <GOOGLE_IP>
+```
+
+This is the actual website IP.
+
+### But can the website IP appear in Additional?
+
+Yes! DNS Additional sections can contain other helpful records, depending on the query and response.
+
+For example, if you query for an MX record, the Additional section may contain A/AAAA records for the mail servers.
+
+But in our delegation example:
+
+- Authority → tells you which nameservers are responsible.
+- Additional → may provide their IP addresses (glue).
+- Answer → contains the requested DNS record, if available.
+
+For your resolver: Don't interpret every A record in Additional as the website's IP. Identify which hostname each A record belongs to.
+
+
+
+I'm building a recursive DNS resolver in C as part of a course project. My instructor wants a top-down understanding: concept → architecture → data structures → interfaces/APIs → bare code. I've already covered Layer 1 (mental model: recursive vs iterative, root → TLD → authoritative, referrals, glue, CNAME, caching) and Layer 2 (data flow of one query through the resolver). I now need Layer 3 (state and data structures) and Layer 4 (interfaces: syscalls, library calls, byte layouts) for the recursive resolver. Do NOT write the full implementation. I want to understand every piece well enough that writing it is mechanical.
+
+Scope: IPv4 only, UDP only, A and AAAA queries, a single-threaded epoll event loop, with upstream queries to real nameservers. It must be correct and benchmarkable, not production-grade. I've attached my current implementation (recursive_resolver.c). Use it as a reference, but teach the concepts independently, and at the end tell me where my code diverges from what you taught.
+
+LAYER 3: STATE AND DATA STRUCTURES. For each structure, explain what it must remember, why it exists, its fields and their sizes, its lifecycle (created → updated → destroyed), and what goes wrong if it's designed badly:\
+1\. The pending-query table: one entry per in-flight client request. Cover the fields needed (client address and TXID, current qname/qtype, current nameserver, depth counter, CNAME counter, per-hop and overall deadlines, remaining NS candidates). Cover how upstream replies are matched back to entries (TXID plus source port plus source IP plus question match) and the cost of linear scan vs hash lookup.\
+2\. The cache: key (name, type, class), TTL handling (absolute expiry vs remaining TTL, TTL decrement when serving), what to cache (answers, delegations/NS+glue, CNAMEs, negative answers), eviction policy, and the difference between NXDOMAIN and NODATA.\
+3\. The nameserver selection state: the NS list from a referral, which were tried, retry and failover order, and the root hints as bootstrap state.\
+4\. The resolution state machine: draw it out (states, events, transitions): start → query sent → referral → answer → CNAME restart → glueless sub-query → failure/timeout → SERVFAIL. Explain how a glueless delegation requires pausing the parent query and spawning a child query, and what data structure change that implies (parent/child links).\
+5\. Loop and budget limits: max referral depth, max CNAME chain, max total upstream queries per client request, and what attacks these defend against.
+
+LAYER 4: INTERFACES. Cover in execution order, with exact function signatures and what each argument means:\
+1\. The DNS wire format at byte level: the 12-byte header with exact bit positions of QR, OPCODE, AA, TC, RD, RA, Z, AD, CD, RCODE; the question section; the resource record format (NAME, TYPE, CLASS, TTL, RDLENGTH, RDATA); name encoding with length-prefixed labels; and name compression (0xC0 pointers), including how to parse safely without infinite loops. Walk through ONE complete real example: a query for [www.example.com](http://www.example.com/) A and a referral response from a .com server, as annotated hex bytes, showing the answer, authority (NS) and additional (glue A) sections.\
+2\. How to distinguish a referral, an answer, a CNAME, NXDOMAIN and NODATA by looking only at the response header and section counts. Include the exact decision logic.\
+3\. The socket and event-loop calls: socket, bind, recvfrom, sendto, epoll_create1, epoll_ctl, epoll_wait with a timeout for deadlines, SOCK_NONBLOCK and EAGAIN handling, and how timers/deadlines are managed in a single-threaded loop.\
+4\. Randomness and anti-spoofing: getrandom for TXIDs, why source-port randomization matters (the Kaminsky attack), how to randomize ports with one vs many sockets, and bailiwick checking (why a .com server must not be trusted for records outside its zone).\
+5\. Truncation and EDNS: the TC bit and TCP fallback, the 512-byte limit vs EDNS0 OPT records, and what a minimal resolver should do about each.\
+6\. Time APIs: clock_gettime(CLOCK_MONOTONIC) and why not wall-clock time for TTLs.
+
+FORMAT. Go phase by phase in execution order. Use small ASCII diagrams, annotated byte dumps and short C snippets (signatures and usage, not a full program). Before each phase, list the common mistakes and corrections beginners make. Mark clearly anything that is a simplification vs what real resolvers (Unbound, BIND) do. If you're unsure about something, say so instead of guessing. End with: (a) a table mapping each concept to the exact syscall or struct it uses, (b) a review of my attached code listing specific bugs, gaps or divergences from what you taught, and (c) a 10-question quiz with answers and explanations.
+
+
+# Recursive DNS resolver in C — Layers 3 and 4
+
+We'll approach this as a systems-design lesson, not a code walkthrough. The objective is that, after understanding the state and interfaces, you should be able to implement each function yourself.
+
+I've inspected the uploaded `recursive_resolver.c`. One important observation before we begin:
+
+Important architectural distinction
+
+Your current implementation is an iterative resolver exposed as a client-facing DNS server. It does walk root → TLD → authoritative nameservers itself, but it does not yet implement all the behavior expected of a robust recursive resolver.
+
+In particular, it currently:
+
+- Has one pending-query object per client request.
+- Uses one shared upstream UDP socket.
+- Uses a fixed-size cache and pending-query pool.
+- Follows referrals and CNAMEs.
+- Does not implement glueless delegation using child queries.
+- Does not fully validate upstream responses.
+- Does not yet implement proper negative caching, bailiwick checking, or complete DNS response semantics.
+
+We'll first establish the correct design independently. Then we'll compare it with your implementation, including specific bugs.
+
+## The overall architecture
+
+Client-facing DNS server
+
+UDP :5353
+
+Pending table
+
+In-flight requests
+
+DNS cache
+
+Previously learned records
+
+Resolution engine
+
+State machine · referrals · CNAME · retries · child lookups
+
+Upstream transport
+
+UDP sockets · TXIDs · nameserver selection · deadlines
+
+Root → TLD → Authoritative DNS
+
+There are two separate kinds of state:
+
+1. Long-lived state: cache entries, root hints, socket descriptors and configuration.
+2. Per-request state: client information, current nameserver, transaction IDs, deadlines, referral progress and CNAME progress.
+
+Keeping these separate is one of the most important design decisions.
+
+# LAYER 3 — State and data structures
+
+## Phase 1. Pending-query table
+
+### Common beginner mistakes
+
+- Storing only the original domain name and transaction ID.
+- Assuming a transaction ID uniquely identifies an upstream response.
+- Reusing a pending entry before all its replies are impossible.
+- Confusing the original client query with the current upstream query.
+- Using a single timeout for the entire resolution and every individual hop.
+
+### 1.1 Why does the pending table exist?
+
+Imagine these three clients send queries almost simultaneously:
+
+```
+Client A: www.google.com A
+Client B: example.com A
+Client C: github.com AAAA
+```
+
+Your resolver starts three independent resolution processes.
+
+All three are waiting for responses from external DNS servers.
+
+The resolver must remember:
+
+- Which client initiated each request?
+- Which question did that client ask?
+- Which nameserver did we contact?
+- Which transaction ID did we use?
+- What should happen when a response arrives?
+- How long should we wait?
+
+This is precisely what the pending-query table does.
+
+One entry represents one outstanding client request, not one individual UDP packet.
+
+### 1.2 Suggested structure
+
+```
+#define MAX_NAME 256
+#define MAX_NS 16
+
+struct pending_query {
+    // Original client request
+    struct sockaddr_in client_addr;
+    uint16_t client_txid;
+    uint16_t client_qtype;
+    char original_qname[MAX_NAME];
+
+    // Current resolution target
+    char current_qname[MAX_NAME];
+    uint16_t current_qtype;
+    uint16_t current_qclass;
+
+    // Current upstream transaction
+    uint16_t upstream_txid;
+    struct sockaddr_in current_ns;
+
+    // Resolution progress
+    uint16_t depth;
+    uint16_t cname_count;
+    uint32_t upstream_queries_sent;
+
+    // Nameserver candidates
+    struct sockaddr_in ns_candidates[MAX_NS];
+    uint16_t ns_count;
+    uint16_t ns_next;
+    uint16_t ns_tried_mask;
+
+    // Deadlines: monotonic milliseconds
+    uint64_t hop_deadline_ms;
+    uint64_t overall_deadline_ms;
+
+    // Parent-child resolution relationships
+    int32_t parent_id;
+    int32_t child_id;
+
+    // State
+    uint8_t state;
+    uint8_t active;
+};
+```
+
+Let's understand the fields rather than memorize them.
+
+### 1.3 Field-by-field reasoning
+
+| Field                   | Size          | Why it exists                                    |
+| ----------------------- | ------------- | ------------------------------------------------ |
+| `client_addr`           | 16 bytes      | Where to send the final response                 |
+| `client_txid`           | 2 bytes       | Restore the client's original DNS transaction ID |
+| `original_qname`        | 256 bytes     | Preserve what the client originally asked        |
+| `current_qname`         | 256 bytes     | Track the name currently being resolved          |
+| `current_qtype`         | 2 bytes       | A or AAAA for the current lookup                 |
+| `upstream_txid`         | 2 bytes       | Match an upstream DNS response                   |
+| `current_ns`            | 16 bytes      | Current upstream destination                     |
+| `depth`                 | 2 bytes       | Limit referral traversal                         |
+| `cname_count`           | 2 bytes       | Limit CNAME traversal                            |
+| `upstream_queries_sent` | 4 bytes       | Limit total work                                 |
+| `ns_candidates`         | 16 × 16 bytes | Candidate IPv4 nameservers                       |
+| `ns_count`              | 2 bytes       | Number of candidates                             |
+| `ns_next`               | 2 bytes       | Next candidate to try                            |
+| `hop_deadline_ms`       | 8 bytes       | Current upstream timeout                         |
+| `overall_deadline_ms`   | 8 bytes       | Entire request timeout                           |
+| `parent_id`, `child_id` | 4 bytes each  | Glueless resolution dependencies                 |
+| `state`                 | 1 byte        | State-machine position                           |
+
+These are typical sizes on Linux with the given types. Actual structure size can be larger because of alignment and padding. `sockaddr_in` is commonly 16 bytes on Linux.
+
+Notice the distinction between `original_qname` and `current_qname`.
+
+Suppose:
+
+```
+Client asks: www.example.com A
+
+Authoritative server says:
+www.example.com CNAME server.example.net
+
+New lookup:
+server.example.net A
+```
+
+Your resolver must still eventually respond to the client with the original question context. If you overwrite the original name without preserving it, response construction becomes error-prone.
+
+### 1.4 Lifecycle
+
+1. Created
+
+   A client query arrives. Allocate an unused pending entry and copy the client's address, TXID and question.
+2. Updated
+
+   Every referral changes the current nameserver and candidate list. Every retry updates the upstream TXID and hop deadline. A CNAME changes the current name.
+3. Completed
+
+   The resolver obtains a final answer, a definitive negative answer, or a failure.
+4. Destroyed
+
+   Send the response to the client and release the pending entry.
+
+Never release an entry while it still has a child lookup or an active upstream transaction that could be mistaken for a future request.
+
+### 1.5 Matching upstream responses
+
+This is particularly important.
+
+Suppose you sent:
+
+```
+TXID: 0xA123
+Destination: 192.0.2.10:53
+Question: www.example.com A
+```
+
+A response arrives.
+
+You should verify:
+
+1. Does the response TXID match?
+2. Does the source IP match the nameserver we queried?
+3. Does the source port match the destination port (53)?
+4. Is the packet a response (`QR=1`)?
+5. Does the question match the expected name, type and class?
+6. Is the response structurally valid?
+
+A useful conceptual matching key is:
+
+```
+(upstream TXID,
+ upstream local port,
+ expected source IP,
+ expected source port,
+ QNAME,
+ QTYPE,
+ QCLASS)
+```
+
+The upstream local port matters because DNS responses arrive at the socket's local port. With a single fixed upstream socket, that port is shared by every request.
+
+TXID alone is not sufficient.
+
+An attacker can forge a response with a guessed TXID. Matching the source endpoint and question substantially strengthens validation.
+
+### 1.6 Linear scan versus hash lookup
+
+Your code currently has:
+
+```
+static struct pending_query *pending_find_by_txid(uint16_t txid);
+```
+
+It scans all 4096 entries.
+
+If there are \\(N\\) pending queries:
+
+\\[ T(N)=O(N) \\]
+
+For 4096 entries, the worst case is 4096 comparisons per incoming response.
+
+A hash table gives expected:
+
+\\[ T(N)=O(1) \\]
+
+A practical hash key could combine:
+
+```
+upstream_txid + local_socket_id + expected_source_endpoint
+```
+
+Then verify the question after finding the candidate.
+
+For a course project, a linear scan is acceptable at low concurrency, but benchmark it at increasing loads. A hash table becomes more important as concurrency increases.
+
+Simplification: A fixed array with linear lookup is a reasonable first implementation. A production resolver needs more sophisticated transaction tracking.
+
+## Phase 2. DNS cache
+
+### Common beginner mistakes
+
+- Caching only the final A record.
+- Using `(name, type)` as the entire cache key.
+- Treating NXDOMAIN and NODATA as the same result.
+- Resetting TTL whenever a cached answer is served.
+- Caching glue without checking whether it is trustworthy.
+- Storing compressed DNS names as raw RDATA and reusing them in another packet.
+
+### 2.1 What should the cache remember?
+
+A DNS cache is not simply:
+
+```
+google.com → 142.x.x.x
+```
+
+It needs to remember different kinds of DNS information.
+
+| Information    | Example                                 | Why cache it?                        |
+| -------------- | --------------------------------------- | ------------------------------------ |
+| A records      | `example.com → IPv4`                    | Avoid repeating lookup               |
+| AAAA records   | `example.com → IPv6`                    | Avoid repeating lookup               |
+| CNAME          | `www.example.com → example.net`         | Avoid repeating alias resolution     |
+| NS records     | `example.com → ns1.example.com`         | Avoid rediscovering delegation       |
+| Glue A records | `ns1.example.com → IPv4`                | Avoid resolving nameserver addresses |
+| NXDOMAIN       | Name doesn't exist                      | Avoid repeating negative lookup      |
+| NODATA         | Name exists, but requested type doesn't | Avoid repeating type-specific lookup |
+
+A useful conceptual representation:
+
+```
+struct cache_key {
+    char name[256];
+    uint16_t type;
+    uint16_t class;
+};
+
+struct cached_record {
+    uint16_t type;
+    uint16_t class;
+    uint32_t ttl;
+    uint64_t expires_at_ms;
+
+    uint16_t rdlength;
+    uint8_t rdata[512];
+};
+
+struct cache_entry {
+    struct cache_key key;
+
+    struct cached_record records[16];
+    uint16_t record_count;
+
+    uint8_t negative_kind;
+    uint64_t expires_at_ms;
+
+    struct cache_entry *hash_next;
+    struct cache_entry *lru_prev;
+    struct cache_entry *lru_next;
+};
+```
+
+This is a teaching representation. A better implementation would store RRsets and negative entries as separate variants, rather than mixing all record types into one structure.
+
+### 2.2 Why is the cache key `(name, type, class)`?
+
+Consider:
+
+```
+google.com A
+google.com AAAA
+google.com MX
+```
+
+These are three different questions.
+
+A cache entry for:
+
+```
+google.com A
+```
+
+must not accidentally answer:
+
+```
+google.com AAAA
+```
+
+Likewise, DNS supports different classes, although your project can restrict itself to `IN`.
+
+The general key is:
+
+\\[ K=(QNAME,QTYPE,QCLASS) \\]
+
+DNS names are case-insensitive, so normalize them before hashing.
+
+One additional complication: CNAME records are special. If you ask for `www.example.com A`, the answer might be a CNAME. You must be able to find the CNAME even though the cache key for the original query was A.
+
+A practical solution is to store CNAME RRsets under their own key:
+
+```
+(www.example.com, CNAME, IN)
+```
+
+Then the resolution algorithm explicitly checks for an applicable CNAME when an A/AAAA lookup misses.
+
+### 2.3 TTL: absolute expiry versus remaining TTL
+
+This is one of the most important implementation details.
+
+Suppose an authoritative server returns:
+
+```
+example.com. 300 IN A 93.184.216.34
+```
+
+You receive this record at:
+
+```
+t = 1000 seconds
+```
+
+Its expiry is:
+
+\\[ t\_{\text{expiry}}=1000+300=1300 \\]
+
+Store the absolute expiry, not just the original TTL.
+
+```
+uint64_t expires_at_ms;
+```
+
+When serving the answer:
+
+\\[ TTL\_{\text{remaining}}= \left\lfloor \frac{t\_{\text{expiry}}-t\_{\text{now}}}{1000} \right\rfloor \\]
+
+Example:
+
+| Time   | Remaining TTL |
+| ------ | ------------- |
+| 1000 s | 300           |
+| 1050 s | 250           |
+| 1100 s | 200           |
+| 1299 s | 1             |
+| 1300 s | Expired       |
+
+You must not send TTL=300 every time someone asks for the cached record.
+
+That would continuously refresh its lifetime and violate DNS caching semantics.
+
+Useful distinction:
+
+- Stored TTL: original TTL or an expiry timestamp.
+- Served TTL: remaining lifetime.
+
+I recommend absolute monotonic expiry timestamps internally.
+
+### 2.4 What happens when a cache entry expires?
+
+There are two reasonable strategies.
+
+Lazy expiration
+
+Check expiry whenever an entry is looked up.
+
+```
+if (now_ms() >= entry->expires_at_ms) {
+    remove_entry(entry);
+    return NULL;
+}
+```
+
+Periodic expiration
+
+Scan the cache periodically and remove expired entries.
+
+For your project, lazy expiration plus occasional cleanup is sufficient.
+
+### 2.5 Eviction policy
+
+The cache has finite memory.
+
+Suppose you allow 8192 entries. What happens when entry 8193 arrives?
+
+You need an eviction policy.
+
+Common choices:
+
+| Policy | Behavior                         |
+| ------ | -------------------------------- |
+| FIFO   | Remove oldest inserted           |
+| LRU    | Remove least recently accessed   |
+| LFU    | Remove least frequently accessed |
+| Random | Remove a random entry            |
+
+For your project, use LRU.
+
+Maintain a doubly linked list:
+
+```
+Most recently used
+       |
+       v
+  [A] ↔ [B] ↔ [C] ↔ [D]
+                         |
+                         v
+                  Least recently used
+```
+
+When an entry is accessed:
+
+1. Remove it from its current position.
+2. Insert it at the front.
+
+When capacity is exhausted:
+
+1. Remove the tail.
+2. Remove it from the hash bucket.
+3. Reuse its memory.
+
+The hash table and LRU list serve different purposes:
+
+- Hash table: find an entry quickly.
+- LRU list: decide which entry to evict.
+
+### 2.6 NXDOMAIN versus NODATA
+
+This distinction is frequently tested.
+
+Suppose:
+
+```
+example.com exists.
+```
+
+But it has no AAAA record.
+
+You ask:
+
+```
+example.com AAAA
+```
+
+The server responds:
+
+```
+RCODE = NOERROR
+Answer count = 0
+```
+
+This is NODATA.
+
+Now suppose you ask:
+
+```
+doesnotexist.example.com A
+```
+
+The server responds:
+
+```
+RCODE = NXDOMAIN
+```
+
+The difference:
+
+| Property                          | NXDOMAIN  | NODATA      |
+| --------------------------------- | --------- | ----------- |
+| Does the name exist?              | No        | Yes         |
+| Requested record exists?          | No        | No          |
+| RCODE                             | 3         | 0           |
+| Usually contains SOA in authority | Yes       | Yes         |
+| Negative cache scope              | Name-wide | Name + type |
+
+Why does the cache scope matter?
+
+Imagine:
+
+```
+example.com A → NXDOMAIN
+```
+
+You cannot then return an A-record result for `example.com AAAA` based on that entry alone without considering the actual name-wide negative result.
+
+For NODATA:
+
+```
+example.com AAAA → NODATA
+```
+
+You can still have:
+
+```
+example.com A → valid IPv4 address
+```
+
+### 2.7 Negative caching TTL
+
+Negative responses commonly include an SOA record in the Authority section.
+
+The negative caching TTL is derived from:
+
+\\[ TTL\_{\text{negative}}= \min(TTL\_{\text{SOA}},SOA.MINIMUM) \\]
+
+You should parse the SOA RDATA properly. Its fields are:
+
+```
+MNAME
+RNAME
+SERIAL
+REFRESH
+RETRY
+EXPIRE
+MINIMUM
+```
+
+The last four bytes of SOA RDATA contain `MINIMUM`, but you must not assume the entire SOA has a fixed length because MNAME and RNAME are variable-length DNS names.
+
+Simplification: For a course implementation, support basic SOA-based negative caching for NXDOMAIN and NODATA. Production resolvers have more extensive negative-cache rules.
+
+### 2.8 What exactly should your resolver cache?
+
+I recommend these categories:
+
+| Category            | Cache?                      | Key               |
+| ------------------- | --------------------------- | ----------------- |
+| A RRset             | Yes                         | name, A, IN       |
+| AAAA RRset          | Yes                         | name, AAAA, IN    |
+| CNAME RRset         | Yes                         | name, CNAME, IN   |
+| Delegation NS RRset | Yes                         | zone, NS, IN      |
+| Glue A              | Yes, after bailiwick checks | nameserver, A, IN |
+| NXDOMAIN            | Yes                         | name, IN          |
+| NODATA              | Yes                         | name, type, IN    |
+| SERVFAIL            | Initially no                | —                 |
+
+Do not blindly cache every record in the Additional section.
+
+Some records are merely hints, and some may be outside the authority's bailiwick.
+
+## Phase 3. Nameserver selection state
+
+### Common beginner mistakes
+
+- Keeping only one nameserver IP.
+- Treating all NS records as equally trustworthy.
+- Forgetting which servers have already timed out.
+- Restarting at the root for every timeout.
+- Treating an NS hostname and its IP address as the same thing.
+
+### 3.1 Why do we need a separate nameserver state?
+
+Suppose a referral contains:
+
+```
+example.com IN NS ns1.example.com
+example.com IN NS ns2.example.com
+example.com IN NS ns3.example.com
+```
+
+Your resolver must remember three things:
+
+1. Which nameservers are available?
+2. Which IP addresses belong to them?
+3. Which ones have already been tried?
+
+A useful structure:
+
+```
+struct ns_candidate {
+    char hostname[256];
+
+    struct in_addr ipv4[4];
+    uint8_t ipv4_count;
+
+    uint8_t tried;
+    uint8_t failed;
+
+    uint32_t timeout_count;
+};
+
+struct delegation {
+    char zone_name[256];
+
+    struct ns_candidate candidates[16];
+    uint16_t candidate_count;
+    uint16_t next_candidate;
+};
+```
+
+Notice that a nameserver can have multiple IPv4 addresses.
+
+Your existing code only stores one `sockaddr_in` per candidate and stops after finding the first matching glue A record.
+
+That is a simplification.
+
+### 3.2 Nameserver selection algorithm
+
+Suppose the referral gives:
+
+```
+ns1 → 192.0.2.1
+ns2 → 192.0.2.2
+ns3 → 192.0.2.3
+```
+
+You could implement:
+
+```
+Candidate list:
+    ns1
+    ns2
+    ns3
+
+next_candidate = 0
+```
+
+On sending:
+
+```
+Try ns1
+next_candidate = 1
+```
+
+If ns1 times out:
+
+```
+Try ns2
+next_candidate = 2
+```
+
+If ns2 times out:
+
+```
+Try ns3
+next_candidate = 3
+```
+
+If ns3 responds:
+
+```
+Process response.
+```
+
+If every candidate fails:
+
+```
+Return to parent delegation or restart from root,
+depending on the current resolution context and budget.
+```
+
+For a more advanced implementation, keep RTT estimates and prefer faster servers, while still retaining failover.
+
+### 3.3 Root hints
+
+How do you start if you have never resolved anything?
+
+You need a bootstrap list.
+
+This is called the root hints.
+
+```
+struct root_hint {
+    char hostname[64];
+    struct in_addr ipv4;
+};
+
+static const struct root_hint roots[] = {
+    { "a.root-servers.net", /* IPv4 */ },
+    { "b.root-servers.net", /* IPv4 */ },
+    // ...
+};
+```
+
+These addresses allow you to begin the resolution process.
+
+The initial resolution looks like:
+
+```
+Client asks for www.example.com A
+             |
+             v
+Cache miss
+             |
+             v
+Choose a root hint
+             |
+             v
+Send query to root server
+```
+
+Root hints are bootstrap configuration, not ordinary delegation records.
+
+Important: The 13 root server identities are not limited to 13 physical machines. Root servers operate globally distributed anycast infrastructure.
+
+Your project can use a static IPv4 root-hints array, but a real resolver should have a way to refresh root hints.
+
+### 3.4 Glue versus glueless delegation
+
+This leads to an important architectural case.
+
+Suppose a referral gives:
+
+```
+example.com IN NS ns1.otherdomain.net
+```
+
+But no glue A record is provided.
+
+Your resolver knows the hostname of the nameserver, but not its IP.
+
+It must resolve:
+
+```
+ns1.otherdomain.net A
+```
+
+This is called a glueless delegation.
+
+We will see why this changes the pending-query architecture in Phase 4.
+
+## Phase 4. Resolution state machine
+
+### Common beginner mistakes
+
+- Writing one large function containing all resolution logic.
+- Treating every response with an NS record as a referral.
+- Treating every nonempty Answer section as a final answer.
+- Forgetting that CNAME changes the name being resolved.
+- Blocking the event loop while resolving a nameserver's hostname.
+
+A resolver is naturally modeled as a state machine.
+
+### 4.1 The states
+
+I recommend these conceptual states:
+
+| State              | Meaning                                  |
+| ------------------ | ---------------------------------------- |
+| `NEW`              | Request received                         |
+| `CACHE_CHECK`      | Check for cached answer                  |
+| `QUERY_READY`      | Select next nameserver                   |
+| `WAIT_UPSTREAM`    | UDP query sent; waiting                  |
+| `PROCESS_RESPONSE` | Parse and classify response              |
+| `FOLLOW_REFERRAL`  | Update delegation                        |
+| `FOLLOW_CNAME`     | Change current QNAME                     |
+| `WAIT_CHILD`       | Waiting for a glueless NS-address lookup |
+| `COMPLETE`         | Final answer obtained                    |
+| `FAILED`           | Resolution cannot continue               |
+
+You don't need a separate state for every tiny operation. The important thing is that the current state and the next event determine what happens.
+
+### 4.2 Draw the state machine
+
+NEW
+
+CACHE_CHECK
+
+Cache hit
+
+COMPLETE
+
+Cache miss
+
+QUERY_READY
+
+WAIT_UPSTREAM
+
+Response received
+
+PROCESS_RESPONSE
+
+Referral
+
+Update NS candidates
+
+QUERY_READY
+
+Answer
+
+Cache result
+
+COMPLETE
+
+CNAME
+
+Update current QNAME
+
+QUERY_READY
+
+Glueless
+
+Spawn child lookup
+
+WAIT_CHILD
+
+Timeout, invalid response, budget exhausted or unrecoverable error
+
+FAILED → SERVFAIL
+
+The diagram is conceptual: a timeout can also transition back to `QUERY_READY` when another nameserver is available.
+
+### 4.3 Events and transitions
+
+Consider the state `WAIT_UPSTREAM`.
+
+It can receive several events:
+
+| Event              | Action                                   |
+| ------------------ | ---------------------------------------- |
+| Valid final answer | Cache, complete                          |
+| Valid referral     | Update delegation, send next query       |
+| CNAME              | Change current name, restart resolution  |
+| NXDOMAIN           | Negative-cache, complete                 |
+| NODATA             | Negative-cache, complete                 |
+| Timeout            | Try another nameserver                   |
+| SERVFAIL           | Try another nameserver if budget permits |
+| Malformed packet   | Discard or retry another server          |
+| Overall deadline   | Return SERVFAIL                          |
+
+The key idea:
+
+The event loop receives packets; the state machine decides what those packets mean.
+
+Don't mix socket reading, DNS parsing, nameserver selection and response construction into one giant handler.
+
+### 4.4 Glueless delegation: why parent-child relationships are necessary
+
+This is probably the most important new data-structure concept in this section.
+
+Suppose the original request is:
+
+```
+www.example.com A
+```
+
+The `.com` server responds:
+
+```
+example.com NS ns1.otherdomain.net
+```
+
+No glue is available.
+
+Your resolver needs to find:
+
+```
+ns1.otherdomain.net A
+```
+
+But it must not forget the original request.
+
+Think of it as two concurrent logical tasks:
+
+Parent query P
+
+`www.example.com A`
+
+Paused
+
+Needs the IP address of ns1.otherdomain.net before continuing.
+
+Creates dependency
+
+Child query C
+
+`ns1.otherdomain.net A`
+
+Running
+
+Uses the normal resolution process to discover the nameserver's address.
+
+Child completes
+
+Returns `ns1.otherdomain.net → IPv4`.
+
+Parent P resumes and queries that IP for `www.example.com A`.
+
+This is a dependency graph, not merely a sequence of packets.
+
+A minimal parent-child representation:
+
+```
+struct pending_query {
+    int32_t parent_id;
+    int32_t child_id;
+
+    // Other resolution fields...
+};
+```
+
+When P creates C:
+
+```
+P.child_id = C.id
+C.parent_id = P.id
+P.state = WAIT_CHILD
+```
+
+When C finishes:
+
+```
+C returns nameserver IP
+       |
+       v
+Find parent P
+       |
+       v
+Insert IP into P's NS candidate list
+       |
+       v
+P.state = QUERY_READY
+       |
+       v
+Resume P
+```
+
+Important implementation detail: Don't use raw pointers into a fixed pending array if entries can be reused. Use stable indices plus generation numbers, or another safe ownership mechanism. Otherwise, a stale parent pointer can point to a newly allocated unrelated query.
+
+Also, a child lookup must be independent. It must not simply wait for the parent to complete, because the parent is waiting for the child. That would deadlock.
+
+There is an additional DNS nuance: if the nameserver is inside the delegated zone itself, missing glue may create a circular dependency. A resolver should try other available authoritative servers or cached address information rather than blindly recursing into an impossible bootstrap cycle.
+
+Production comparison: Real resolvers have more sophisticated delegation dependency tracking, address-family handling and loop detection. Your parent-child model is a good course-project starting point.
+
+## Phase 5. Loop limits and resource budgets
+
+### Common beginner mistakes
+
+- Limiting only CNAME depth.
+- Assuming a referral chain cannot loop.
+- Allowing an unlimited number of upstream requests.
+- Giving every child query a fresh unrestricted timeout.
+- Letting one client consume all pending-query slots.
+
+Your resolver interacts with data supplied by remote DNS servers. You must assume that some responses may be malicious, malformed or cyclic.
+
+### 5.1 Referral depth
+
+Suppose a malicious or broken DNS configuration produces:
+
+```
+Zone A → nameserver B
+Zone B → nameserver A
+Zone A → nameserver B
+...
+```
+
+Without a referral limit, the resolver can continue indefinitely.
+
+Use:
+
+```
+#define MAX_REFERRAL_DEPTH 16
+```
+
+Every accepted referral increments the counter.
+
+When the limit is exceeded:
+
+```
+SERVFAIL
+```
+
+This is not a DNS protocol constant; it is your implementation's safety budget.
+
+### 5.2 CNAME chain limit
+
+Consider:
+
+```
+a.example → b.example
+b.example → c.example
+c.example → d.example
+...
+```
+
+Or an actual loop:
+
+```
+a.example → b.example
+b.example → a.example
+```
+
+Use:
+
+```
+#define MAX_CNAME_CHAIN 16
+```
+
+You can additionally remember visited CNAME names, which detects a cycle earlier than waiting for the maximum depth.
+
+### 5.3 Total upstream query budget
+
+Referral depth and CNAME count do not capture all the work.
+
+Suppose each referral has 10 nameservers and each times out.
+
+You could send many queries without increasing referral depth.
+
+Introduce:
+
+```
+#define MAX_UPSTREAM_QUERIES 64
+```
+
+Increment it for every upstream DNS query sent by the resolution tree, including child lookups.
+
+When the budget is exhausted:
+
+```
+SERVFAIL
+```
+
+This protects against excessive retries and pathological delegation structures.
+
+### 5.4 Overall deadline
+
+You already have:
+
+```
+#define QUERY_TIMEOUT_MS 5000
+#define UPSTREAM_TIMEOUT_MS 2000
+```
+
+These represent two different budgets.
+
+- Per-hop timeout: How long do we wait for the current nameserver?
+- Overall timeout: How long may the entire client request take?
+
+A child lookup should normally consume the parent's remaining overall budget rather than receiving an entirely new five seconds.
+
+Otherwise, malicious nested dependencies can extend resolution indefinitely.
+
+### 5.5 What attacks do these limits defend against?
+
+| Limit                 | Defends against                   |
+| --------------------- | --------------------------------- |
+| Referral depth        | Delegation loops                  |
+| CNAME depth           | CNAME loops and long chains       |
+| Total query budget    | Excessive upstream work           |
+| Overall deadline      | Slow or stalled resolutions       |
+| Pending-query limit   | Memory exhaustion                 |
+| Per-client rate limit | One client monopolizing resources |
+| Packet-size limits    | Oversized or malformed messages   |
+
+For your project, I would begin with:
+
+```
+#define MAX_REFERRAL_DEPTH 16
+#define MAX_CNAME_CHAIN 16
+#define MAX_UPSTREAM_QUERIES 64
+#define MAX_PENDING 4096
+
+#define QUERY_TIMEOUT_MS 5000
+#define UPSTREAM_TIMEOUT_MS 1000
+```
+
+These are reasonable starting values for experimentation, not universal optimal values. Benchmark them and report the resulting latency and failure rates.
+
+# LAYER 4 — Interfaces: syscalls, library calls and byte layouts
+
+Now we move from what the resolver remembers to how it communicates with the operating system and other DNS servers.
+
+The important distinction is:
+
+- DNS protocol defines the bytes.
+- Linux syscalls move those bytes.
+- Your C functions interpret and construct those bytes.
+
+## Phase 6. DNS wire format
+
+### Common beginner mistakes
+
+- Casting a packet buffer directly to a C structure.
+- Assuming all fields use host byte order.
+- Forgetting that DNS names are length-prefixed.
+- Assuming every name is uncompressed.
+- Using `strlen()` on wire-format names.
+- Trusting RDLENGTH without checking packet bounds.
+
+### 6.1 The DNS header: exactly 12 bytes
+
+Every standard DNS message starts with a 12-byte header.
+
+DNS header layout
+
+| Bytes | Field   | Size    |
+| ----- | ------- | ------- |
+| 0–1   | ID      | 16 bits |
+| 2–3   | FLAGS   | 16 bits |
+| 4–5   | QDCOUNT | 16 bits |
+| 6–7   | ANCOUNT | 16 bits |
+| 8–9   | NSCOUNT | 16 bits |
+| 10–11 | ARCOUNT | 16 bits |
+
+All multi-byte DNS integer fields are transmitted in network byte order (big-endian).
+
+Let's unpack the FLAGS field.
+
+It is a 16-bit value:
+
+```
+ 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
++--+-----------+--+--+--+--+--+--+--+-----------+
+|QR|  OPCODE   |AA|TC|RD|RA| Z|AD|CD|   RCODE   |
++--+-----------+--+--+--+--+--+--+--+-----------+
+```
+
+| Bit(s) | Field  | Meaning                          |
+| ------ | ------ | -------------------------------- |
+| 15     | QR     | 0=query, 1=response              |
+| 14–11  | OPCODE | Operation type; 0=standard query |
+| 10     | AA     | Authoritative Answer             |
+| 9      | TC     | Truncated                        |
+| 8      | RD     | Recursion Desired                |
+| 7      | RA     | Recursion Available              |
+| 6      | Z      | Reserved; normally 0             |
+| 5      | AD     | Authentic Data                   |
+| 4      | CD     | Checking Disabled                |
+| 3–0    | RCODE  | Response code                    |
+
+The first byte of FLAGS is packet byte 2:
+
+```
+QR OPCODE OPCODE OPCODE OPCODE AA TC RD
+```
+
+The second byte is packet byte 3:
+
+```
+RA Z AD CD RCODE RCODE RCODE RCODE
+```
+
+Your implementation correctly extracts QR, OPCODE, AA, TC, RD, RA and RCODE, but it doesn't retain AD, CD or Z.
+
+Also, DNS has an extended RCODE mechanism using EDNS OPT records, so the four header RCODE bits are not the complete story once EDNS is supported.
+
+### 6.2 Why not use a packed C structure?
+
+You might be tempted to write:
+
+```
+struct dns_header {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+};
+```
+
+This describes the conceptual layout, but directly casting a received packet to this structure is risky:
+
+- Alignment may be unsuitable.
+- Compiler padding may differ.
+- Values are in network byte order.
+- Bitfield ordering is implementation-dependent.
+
+Instead, read individual fields:
+
+```
+static uint16_t read_u16(const uint8_t *p) {
+    return ((uint16_t)p[0] << 8) | p[1];
+}
+
+static uint32_t read_u32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+```
+
+And similarly write them:
+
+```
+static void write_u16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
+}
+```
+
+These helpers make byte-order handling explicit.
+
+### 6.3 Question section
+
+The question section contains:
+
+```
+QNAME
+QTYPE
+QCLASS
+```
+
+For:
+
+```
+www.example.com A
+```
+
+The QNAME is encoded as:
+
+```
+03 77 77 77
+07 65 78 61 6d 70 6c 65
+03 63 6f 6d
+00
+```
+
+Let's decode it:
+
+| Bytes                  | Interpretation              |
+| ---------------------- | --------------------------- |
+| `03`                   | Next label has 3 characters |
+| `77 77 77`             | `www`                       |
+| `07`                   | Next label has 7 characters |
+| `65 78 61 6d 70 6c 65` | `example`                   |
+| `03`                   | Next label has 3 characters |
+| `63 6f 6d`             | `com`                       |
+| `00`                   | End of name (root label)    |
+
+Then:
+
+```
+00 01  → QTYPE = A
+00 01  → QCLASS = IN
+```
+
+A AAAA query uses:
+
+```
+00 1c
+```
+
+because decimal 28 is hexadecimal `0x001c`.
+
+### 6.4 Resource record format
+
+All answer, authority and additional resource records use the same general layout:
+
+```
+NAME
+TYPE
+CLASS
+TTL
+RDLENGTH
+RDATA
+```
+
+| Field    | Size     |
+| -------- | -------- |
+| NAME     | Variable |
+| TYPE     | 2 bytes  |
+| CLASS    | 2 bytes  |
+| TTL      | 4 bytes  |
+| RDLENGTH | 2 bytes  |
+| RDATA    | Variable |
+
+Examples:
+
+| Type  | Number | RDATA                |
+| ----- | ------ | -------------------- |
+| A     | 1      | 4-byte IPv4 address  |
+| NS    | 2      | DNS name             |
+| CNAME | 5      | DNS name             |
+| SOA   | 6      | Structured fields    |
+| AAAA  | 28     | 16-byte IPv6 address |
+| OPT   | 41     | EDNS pseudo-record   |
+
+For A:
+
+```
+c0 00 02 35
+```
+
+means:
+
+```
+192.0.2.53
+```
+
+For AAAA, the RDATA is exactly 16 bytes.
+
+For NS and CNAME, the RDATA is an encoded DNS name, possibly compressed.
+
+### 6.5 Name compression
+
+DNS messages often repeat domain names.
+
+Instead of writing:
+
+```
+www.example.com
+```
+
+again and again, DNS allows a compression pointer.
+
+The pointer begins with two bits set to `11`:
+
+```
+11xxxxxx xxxxxxxx
+```
+
+Equivalently:
+
+```
+0xC0 | high 6 bits
+low 8 bits
+```
+
+The remaining 14 bits give an offset from the beginning of the DNS message.
+
+For example:
+
+```
+C0 0C
+```
+
+means:
+
+```
+Offset = 0x000C = 12
+```
+
+So the parser jumps to byte 12 of the DNS packet and decodes the name there.
+
+A pointer can also refer to a suffix of a name.
+
+Suppose byte 12 contains:
+
+```
+03 www 07 example 03 com 00
+```
+
+The `example.com` suffix starts at byte 16.
+
+A pointer to that suffix is:
+
+```
+C0 10
+```
+
+### 6.6 Safely parsing compressed names
+
+A robust parser needs to distinguish:
+
+- Where the name is logically decoded.
+- Where the original field ends in the current section.
+
+For example:
+
+```
+int decode_name(
+    const uint8_t *packet,
+    size_t packet_len,
+    size_t *offset,
+    char *output,
+    size_t output_size
+);
+```
+
+The parser should:
+
+1. Verify the current offset is within the packet.
+2. Read the label length.
+3. If zero, finish.
+4. If the top two bits are `11`, read the second pointer byte.
+5. Calculate the 14-bit offset.
+6. Verify the pointer target is inside the packet.
+7. Track visited offsets or impose a strict jump limit.
+8. Reject reserved label encodings.
+9. Ensure the expanded name doesn't exceed DNS's 255-byte wire-name limit.
+10. Return the correct original-field consumption, not the final position after following pointers.
+
+That last point is subtle.
+
+Suppose the name field contains:
+
+```
+03 www C0 10
+```
+
+The original field consumes only four bytes:
+
+```
+03 77 77 77 C0 10
+```
+
+Even though the parser follows the pointer to another location, the next field in the original packet begins immediately after those four bytes.
+
+For an RR's RDATA, there is an extra constraint: the original encoding must consume no more than RDLENGTH. The pointer target can be elsewhere in the packet, but the pointer bytes themselves must fit inside RDATA.
+
+Your parser checks the whole packet boundary, but it does not currently enforce this RDATA-specific consumption rule.
+
+### 6.7 One complete referral example
+
+Let's construct a concrete DNS exchange.
+
+Client wants:
+
+```
+www.example.com A
+```
+
+The `.com` server returns a referral to the authoritative nameserver for `example.com`.
+
+We will use documentation-only IP addresses:
+
+```
+ns1.example.com → 192.0.2.53
+```
+
+This is an illustrative packet, not a captured live DNS response.
+
+#### A. Query packet
+
+Query: www\.example.com A
+
+Transaction ID = 0x1A2B · RD=0 · QDCOUNT=1
+
+```
+1A 2B 00 00 00 01 00 00
+00 00 00 00
+
+03 77 77 77
+07 65 78 61 6D 70 6C 65
+03 63 6F 6D 00
+
+00 01
+00 01
+```
+
+Interpretation
+
+- `1A 2B`: Transaction ID.
+- `00 00`: Query flags, recursion not requested.
+- `00 01`: One question.
+- `03 www 07 example 03 com 00`: QNAME.
+- `00 01`: A.
+- `00 01`: IN.
+
+#### B. Referral response
+
+The `.com` server replies with:
+
+- Zero answers.
+- One authority NS record.
+- One additional glue A record.
+
+Response: referral to example.com
+
+Transaction ID = 0x1A2B · QR=1 · RCODE=0 · QD=1 · AN=0 · NS=1 · AR=1
+
+```
+1A 2B 80 00 00 01 00 00
+00 01 00 01
+
+03 77 77 77
+07 65 78 61 6D 70 6C 65
+03 63 6F 6D 00
+00 01 00 01
+
+C0 10
+00 02
+00 01
+00 01 51 80
+00 05
+03 6E 73 31 C0 10
+
+03 6E 73 31 C0 10
+00 01
+00 01
+00 01 51 80
+00 04
+C0 00 02 35
+```
+
+Now decode each section.
+
+Header
+
+```
+1A 2B    Transaction ID
+80 00    QR=1, all other flags zero
+00 01    QDCOUNT=1
+00 00    ANCOUNT=0
+00 01    NSCOUNT=1
+00 01    ARCOUNT=1
+```
+
+Question section
+
+```
+www.example.com A IN
+```
+
+The server repeats the original question.
+
+Authority section
+
+```
+C0 10
+00 02
+00 01
+00 01 51 80
+00 05
+03 6E 73 31 C0 10
+```
+
+Interpretation:
+
+| Bytes          | Meaning                  |
+| -------------- | ------------------------ |
+| `C0 10`        | Owner name = example.com |
+| `00 02`        | TYPE = NS                |
+| `00 01`        | CLASS = IN               |
+| `00 01 51 80`  | TTL = 86400 seconds      |
+| `00 05`        | RDLENGTH = 5             |
+| `03 ns1 C0 10` | RDATA = ns1.example.com  |
+
+The pointer `C0 10` refers to `example.com` in the question.
+
+Additional section
+
+```
+03 6E 73 31 C0 10
+00 01
+00 01
+00 01 51 80
+00 04
+C0 00 02 35
+```
+
+Interpretation:
+
+| Bytes          | Meaning                 |
+| -------------- | ----------------------- |
+| `03 ns1 C0 10` | Owner = ns1.example.com |
+| `00 01`        | TYPE = A                |
+| `00 01`        | CLASS = IN              |
+| `00 01 51 80`  | TTL = 86400             |
+| `00 04`        | RDLENGTH = 4            |
+| `C0 00 02 35`  | IP = 192.0.2.53         |
+
+Now the resolver can send the original query to:
+
+```
+192.0.2.53:53
+```
+
+It does not query that IP for `ns1.example.com`. It queries it for:
+
+```
+www.example.com A
+```
+
+That is the entire purpose of glue.
+
+## Phase 7. Classifying DNS responses
+
+### Common beginner mistakes
+
+- Assuming `ANCOUNT > 0` means the final answer was found.
+- Assuming `NSCOUNT > 0` always means referral.
+- Assuming an empty Answer section means NXDOMAIN.
+- Looking only at RCODE and ignoring the actual records.
+- Forgetting that a CNAME can appear alongside the final A/AAAA record.
+
+### 7.1 Can we classify responses using only header flags and section counts?
+
+No, not reliably.
+
+The header gives useful clues, but the resource records must also be inspected.
+
+For example:
+
+```
+NOERROR
+ANCOUNT = 0
+NSCOUNT = 1
+```
+
+This might be a referral, but you still need to check:
+
+- Is the Authority record actually NS?
+- Does its owner name represent a delegation enclosing the queried name?
+- Is the response non-authoritative for the child zone?
+- Is there an SOA indicating an authoritative negative answer?
+
+Similarly:
+
+```
+NOERROR
+ANCOUNT = 0
+NSCOUNT = 1
+```
+
+could be an authoritative response containing other authority information rather than a referral.
+
+### 7.2 Response classification table
+
+| Response     | Header clue        | Record-level evidence                                     |
+| ------------ | ------------------ | --------------------------------------------------------- |
+| Final answer | NOERROR            | Matching requested RRset in Answer                        |
+| CNAME        | NOERROR            | CNAME for queried owner in Answer                         |
+| NXDOMAIN     | RCODE=3            | Name does not exist; typically SOA in Authority           |
+| NODATA       | NOERROR, ANCOUNT=0 | Authoritative negative response, usually SOA in Authority |
+| Referral     | NOERROR            | NS records in Authority representing a child delegation   |
+| SERVFAIL     | RCODE=2            | Resolution failed                                         |
+
+An answer may contain both CNAME and target A/AAAA records. In that case, you may already have everything needed to respond without another upstream query.
+
+### 7.3 Recommended decision logic
+
+Here is the order I recommend.
+
+```
+1. Validate packet structure.
+
+2. Validate:
+   QR = 1
+   OPCODE = 0
+   Transaction ID matches
+   Source endpoint matches
+   Question matches
+
+3. Inspect RCODE.
+
+   NXDOMAIN:
+       Negative-cache if appropriate.
+       Return NXDOMAIN.
+
+   SERVFAIL:
+       Try another nameserver if budget permits.
+
+   Other nonzero RCODE:
+       Handle according to the error.
+
+4. For NOERROR:
+
+   Search Answer for the requested RRset.
+
+   If found:
+       Cache it.
+       Return answer.
+
+   Else if CNAME exists for queried name:
+       Cache CNAME.
+       Resolve target, unless target answer is
+       already present in the same response.
+
+   Else inspect Authority:
+
+       If valid child delegation NS records exist:
+           Process referral.
+
+       Else if authoritative SOA proves no requested RRset:
+           Cache NODATA.
+           Return NOERROR with empty Answer.
+
+       Else:
+           Treat as incomplete/unusable response;
+           retry or fail appropriately.
+```
+
+This is a simplified decision tree. In particular, negative-answer processing needs proper authority and SOA validation, and DNSSEC introduces additional proof requirements.
+
+### 7.4 Why does the NS owner matter?
+
+Suppose your original question is:
+
+```
+www.example.com A
+```
+
+A response contains:
+
+```
+otherdomain.net IN NS ns1.otherdomain.net
+```
+
+You must not blindly follow that NS record.
+
+The relevant delegation must be a zone that is an ancestor of the queried name.
+
+For example:
+
+```
+example.com
+    |
+    +-- www.example.com
+```
+
+The delegation owner `example.com` encloses `www.example.com`.
+
+But `otherdomain.net` does not.
+
+This is also important for referral-loop detection.
+
+## Phase 8. Socket and event-loop interfaces
+
+### Common beginner mistakes
+
+- Thinking `recvfrom()` receives a complete DNS resolution.
+- Using blocking sockets inside an event loop.
+- Assuming UDP packets arrive in the same order they were sent.
+- Ignoring `EAGAIN`.
+- Assuming one `epoll_wait()` event means exactly one datagram.
+- Calling `epoll_wait()` with a fixed timeout without considering actual deadlines.
+
+Let's walk through the execution order.
+
+### 8.1 Create the UDP socket
+
+Exact signature:
+
+```
+int socket(int domain, int type, int protocol);
+```
+
+Arguments:
+
+| Argument   | Meaning               |
+| ---------- | --------------------- |
+| `domain`   | Address family        |
+| `type`     | Socket type and flags |
+| `protocol` | Protocol              |
+
+For your resolver:
+
+```
+int fd = socket(
+    AF_INET,
+    SOCK_DGRAM | SOCK_NONBLOCK,
+    IPPROTO_UDP
+);
+```
+
+- `AF_INET`: IPv4.
+- `SOCK_DGRAM`: Datagram socket.
+- `SOCK_NONBLOCK`: Nonblocking I/O.
+- `IPPROTO_UDP`: UDP protocol.
+
+The kernel returns a file descriptor.
+
+A UDP socket preserves datagram boundaries. One `recvfrom()` receives one datagram, not an arbitrary stream fragment.
+
+### 8.2 Bind the client-facing socket
+
+Signature:
+
+```
+int bind(
+    int sockfd,
+    const struct sockaddr *addr,
+    socklen_t addrlen
+);
+```
+
+Example:
+
+```
+struct sockaddr_in local = {0};
+
+local.sin_family = AF_INET;
+local.sin_addr.s_addr = htonl(INADDR_ANY);
+local.sin_port = htons(5353);
+
+bind(fd, (struct sockaddr *)&local, sizeof(local));
+```
+
+Important functions:
+
+- `htons()`: Host to network short (16-bit).
+- `htonl()`: Host to network long (32-bit).
+
+The resolver now listens on UDP port 5353.
+
+`INADDR_ANY` means all local IPv4 interfaces.
+
+### 8.3 Receive a client query
+
+Signature:
+
+```
+ssize_t recvfrom(
+    int sockfd,
+    void *buf,
+    size_t len,
+    int flags,
+    struct sockaddr *src_addr,
+    socklen_t *addrlen
+);
+```
+
+Example:
+
+```
+uint8_t packet[1232];
+
+struct sockaddr_in client;
+socklen_t client_len = sizeof(client);
+
+ssize_t n = recvfrom(
+    client_fd,
+    packet,
+    sizeof(packet),
+    0,
+    (struct sockaddr *)&client,
+    &client_len
+);
+```
+
+What do you get?
+
+- `packet`: DNS message bytes.
+- `n`: Number of bytes received.
+- `client`: Sender IP and source port.
+
+You need the client address because the resolver must eventually send the answer back to the same client endpoint.
+
+### 8.4 Send a response
+
+Signature:
+
+```
+ssize_t sendto(
+    int sockfd,
+    const void *buf,
+    size_t len,
+    int flags,
+    const struct sockaddr *dest_addr,
+    socklen_t addrlen
+);
+```
+
+Example:
+
+```
+sendto(
+    client_fd,
+    response,
+    response_len,
+    0,
+    (struct sockaddr *)&client,
+    sizeof(client)
+);
+```
+
+For UDP, a datagram is sent atomically. You should treat a short send as an error rather than attempting to continue the remainder as if this were TCP.
+
+### 8.5 Create epoll
+
+Signature:
+
+```
+int epoll_create1(int flags);
+```
+
+Example:
+
+```
+int epfd = epoll_create1(0);
+```
+
+This creates the epoll instance.
+
+### 8.6 Register sockets
+
+Signature:
+
+```
+int epoll_ctl(
+    int epfd,
+    int op,
+    int fd,
+    struct epoll_event *event
+);
+```
+
+Example:
+
+```
+struct epoll_event ev = {0};
+
+ev.events = EPOLLIN;
+ev.data.fd = client_fd;
+
+epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &ev);
+```
+
+You register the client socket and upstream socket.
+
+`EPOLLIN` means that the descriptor is ready for reading.
+
+For nonblocking UDP, level-triggered epoll is a reasonable starting point.
+
+### 8.7 Wait for events
+
+Signature:
+
+```
+int epoll_wait(
+    int epfd,
+    struct epoll_event *events,
+    int maxevents,
+    int timeout
+);
+```
+
+Example:
+
+```
+struct epoll_event events[64];
+
+int n = epoll_wait(
+    epfd,
+    events,
+    64,
+    timeout_ms
+);
+```
+
+Possible outcomes:
+
+- Positive: number of ready events.
+- Zero: timeout expired.
+- Negative: error; check `errno`.
+
+Handle `EINTR` by retrying appropriately.
+
+### 8.8 Nonblocking I/O and EAGAIN
+
+This is important for a single-threaded event loop.
+
+Suppose five UDP responses are queued on your upstream socket.
+
+`epoll_wait()` tells you that the socket is readable.
+
+You should drain available datagrams until the socket returns `EAGAIN` or `EWOULDBLOCK`.
+
+```
+for (;;) {
+    ssize_t n = recvfrom(
+        upstream_fd,
+        buffer,
+        sizeof(buffer),
+        0,
+        (struct sockaddr *)&sender,
+        &sender_len
+    );
+
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+
+        if (errno == EINTR)
+            continue;
+
+        // Handle actual error.
+        break;
+    }
+
+    process_upstream_packet(buffer, n, &sender);
+}
+```
+
+Why?
+
+Because nonblocking I/O means:
+
+> If data is unavailable right now, return instead of waiting.
+
+`EAGAIN` is not a fatal error. It tells you there is currently nothing more to read.
+
+### 8.9 How do deadlines work in a single-threaded event loop?
+
+Your resolver may have 1000 pending queries.
+
+Each one has a different deadline.
+
+You cannot use `sleep()` for each request because that blocks the entire resolver.
+
+Instead, store absolute deadlines:
+
+```
+uint64_t hop_deadline_ms;
+uint64_t overall_deadline_ms;
+```
+
+Before waiting, determine the nearest upcoming deadline.
+
+For example:
+
+```
+Query A deadline: 500 ms
+Query B deadline: 1200 ms
+Query C deadline: 3000 ms
+
+epoll timeout = 500 ms
+```
+
+When epoll returns, process ready packets and expired deadlines.
+
+There are two approaches:
+
+Approach A: Periodic scanning
+
+Every 100 ms, scan the pending array.
+
+- Easy to implement.
+- O(N) per scan.
+- Can introduce up to 100 ms of additional timeout latency.
+
+Approach B: Deadline heap
+
+Maintain a min-heap of deadlines.
+
+```
+           500 ms
+          /      \
+      1200 ms   3000 ms
+```
+
+The smallest deadline is at the root.
+
+The next epoll timeout is:
+
+\\[ timeout=\max(0,t\_{\text{nearest}}-t\_{\text{now}}) \\]
+
+This is more efficient for large pending tables.
+
+Production comparison: Real systems often use timer heaps, timing wheels or other optimized deadline structures.
+
+For your first version, periodic scanning is acceptable. For benchmarking high concurrency, implement a deadline heap or equivalent.
+
+## Phase 9. Randomness and anti-spoofing
+
+### Common beginner mistakes
+
+- Assuming a random TXID alone prevents spoofing.
+- Using `rand()` as a security mechanism.
+- Using a single shared UDP socket and forgetting that every query has the same source port.
+- Accepting arbitrary Additional-section records.
+- Checking the source IP but ignoring the source port.
+
+### 9.1 Random transaction IDs
+
+DNS transaction IDs are 16 bits.
+
+That gives:
+
+\\[ 2^{16}=65536 \\]
+
+possible values.
+
+An attacker trying to inject a fake response must guess the transaction ID.
+
+Use Linux's `getrandom()`:
+
+```
+#include <sys/random.h>
+
+uint16_t txid;
+
+ssize_t n = getrandom(
+    &txid,
+    sizeof(txid),
+    0
+);
+```
+
+Exact signature:
+
+```
+ssize_t getrandom(
+    void *buf,
+    size_t buflen,
+    unsigned int flags
+);
+```
+
+Unlike `rand()`, this obtains randomness from the operating system's cryptographic random source.
+
+Your implementation uses `getrandom()` but falls back to `rand()`.
+
+For security-sensitive transaction identifiers, do not use that weak fallback. Handle short reads and `EINTR`, and fail safely if secure randomness is unavailable.
+
+Also, ensure that you don't reuse an outstanding transaction ID on the same socket.
+
+### 9.2 Why source-port randomization matters
+
+This connects to the famous Kaminsky DNS cache-poisoning attack.
+
+Suppose the resolver always sends queries from:
+
+```
+192.0.2.100:40000
+```
+
+An attacker knows or guesses that port and tries to forge DNS responses.
+
+If the attacker also guesses the 16-bit TXID, the fake response might be accepted.
+
+With source-port randomization, the attacker must guess:
+
+- Transaction ID.
+- Source port.
+- Relevant DNS response details.
+
+The combined search space is much larger.
+
+The conceptual entropy is:
+
+\\[ H=H\_{\text{TXID}}+H\_{\text{port}} \\]
+
+Assuming independent, uniformly distributed values.
+
+### 9.3 One socket versus multiple sockets
+
+One upstream socket
+
+```
+Resolver
+  |
+  +-- UDP socket, source port 40000
+         |
+         +-- Query A
+         +-- Query B
+         +-- Query C
+```
+
+All queries use the same local source port.
+
+This is simple, but it gives you no per-query source-port randomization.
+
+Multiple upstream sockets
+
+```
+Resolver
+  |
+  +-- Socket A: port 41021
+  +-- Socket B: port 52013
+  +-- Socket C: port 63042
+```
+
+Now the source ports vary.
+
+A practical course implementation could create a socket per outstanding transaction:
+
+1. Create nonblocking UDP socket.
+2. Bind to a randomized local port.
+3. Register with epoll.
+4. Send query.
+5. Receive and validate response.
+6. Close socket when the transaction completes.
+
+Alternatively, use a bounded pool of sockets with distinct randomized source ports.
+
+Creating one socket per query is easier to reason about but has higher descriptor and resource overhead.
+
+Important: Randomized ephemeral port allocation by the kernel is useful, but don't assume a particular security property without checking the operating system's behavior. Avoid fixed source ports.
+
+### 9.4 Source validation
+
+For every upstream response, validate:
+
+```
+Response source IP   == expected nameserver IP
+Response source port == expected nameserver port (53)
+Response TXID        == expected upstream TXID
+Question             == expected QNAME/QTYPE/QCLASS
+QR                   == 1
+```
+
+Your current code checks source IP and TXID, but does not check source port or question equality.
+
+### 9.5 Bailiwick checking
+
+This is another major security concept.
+
+Suppose a `.com` server tells you:
+
+```
+example.com IN NS ns1.example.com
+```
+
+And supplies:
+
+```
+ns1.example.com IN A 192.0.2.53
+```
+
+That is appropriate glue for the delegation.
+
+But imagine the response also includes:
+
+```
+bank.com IN A 203.0.113.99
+```
+
+You should not blindly trust and cache that record.
+
+The `.com` server's referral is about delegating `example.com`. The unrelated `bank.com` record is outside the relevant delegation.
+
+A resolver must determine which records are in-bailiwick and which are not.
+
+For a delegation of `example.com`:
+
+| Additional record           | Treatment                    |
+| --------------------------- | ---------------------------- |
+| `ns1.example.com A ...`     | Potentially valid glue       |
+| `ns2.example.com A ...`     | Potentially valid glue       |
+| `ns1.otherdomain.net A ...` | Not glue for this delegation |
+| `bank.com A ...`            | Ignore for this referral     |
+
+The rule is not simply "trust all records sent by an authoritative server."
+
+It is:
+
+> Accept only records that are relevant to the delegation and within the appropriate authority/bailiwick boundaries.
+
+For out-of-bailiwick NS hostnames, resolve their addresses separately.
+
+Your current code matches an Additional A record against an NS hostname, but does not verify that the glue is actually in-bailiwick.
+
+That is a significant security gap.
+
+Simplification: Implement strict bailiwick checking for referrals and cache only matching in-bailiwick glue. Production resolvers have more nuanced trust and delegation rules.
+
+## Phase 10. Truncation and EDNS
+
+### Common beginner mistakes
+
+- Assuming UDP DNS messages can always fit in 512 bytes.
+- Ignoring the TC bit.
+- Assuming a 1500-byte receive buffer automatically enables EDNS.
+- Forgetting that EDNS uses an OPT pseudo-record.
+- Treating a truncated answer as complete.
+
+### 10.1 The original 512-byte limit
+
+Historically, DNS over UDP was limited to 512 bytes.
+
+A response larger than this could be truncated.
+
+The DNS server sets:
+
+```
+TC = 1
+```
+
+This means the message is truncated.
+
+The resolver should not treat the incomplete answer as final.
+
+Traditionally, it retries the query using TCP.
+
+### 10.2 What is EDNS0?
+
+EDNS0 extends DNS capabilities.
+
+It introduces an OPT pseudo-record in the Additional section.
+
+The resolver can advertise a larger UDP payload size.
+
+For example:
+
+```
+OPT record:
+TYPE = 41
+CLASS = 1232
+```
+
+The CLASS field in an OPT record represents the advertised UDP payload size, not the ordinary DNS class IN.
+
+Why 1232?
+
+It is a commonly used conservative UDP payload size intended to reduce IP fragmentation risk.
+
+An OPT record also carries extended flags and options.
+
+### 10.3 What should your resolver do?
+
+For your UDP-only course project:
+
+1. Support DNS messages up to a reasonable buffer limit.
+2. Add a minimal EDNS0 OPT record to upstream queries.
+3. Advertise an appropriate UDP payload size, such as 1232.
+4. Parse OPT records separately from ordinary resource records.
+5. Check TC in every upstream response.
+6. Never return a truncated response as though it were complete.
+
+There is an unavoidable limitation:
+
+You cannot guarantee full DNS correctness with UDP-only transport.
+
+If a nameserver returns TC=1, the standard completion mechanism is TCP fallback. Since you explicitly exclude TCP, you must either:
+
+- Try another authoritative server that returns an untruncated response, or
+- Return SERVFAIL if no usable complete answer can be obtained.
+
+You cannot guarantee the second server will provide a complete response.
+
+### 10.4 How does your current code compare?
+
+Your code has:
+
+```
+#define BUF_SIZE 1500
+```
+
+This is a buffer size, not an EDNS implementation.
+
+It does not currently append an OPT record to its upstream queries.
+
+It also does not handle the TC bit in its response-processing logic.
+
+So a response could be truncated and your resolver might incorrectly process an incomplete set of records.
+
+## Phase 11. Time APIs and TTL correctness
+
+### Common beginner mistakes
+
+- Using `time(NULL)` for cache expiry.
+- Using wall-clock timestamps for timeouts.
+- Resetting TTL whenever a record is served.
+- Confusing the current clock time with elapsed time.
+
+### 11.1 Why CLOCK_MONOTONIC?
+
+Linux provides:
+
+```
+int clock_gettime(
+    clockid_t clockid,
+    struct timespec *tp
+);
+```
+
+Use:
+
+```
+struct timespec ts;
+
+clock_gettime(CLOCK_MONOTONIC, &ts);
+```
+
+This gives a clock that is suitable for measuring elapsed time.
+
+Why not `CLOCK_REALTIME`?
+
+Because wall-clock time can change.
+
+For example:
+
+```
+10:00:00
+10:00:01
+10:00:02
+```
+
+Then an NTP adjustment or manual clock change occurs:
+
+```
+09:59:30
+09:59:31
+```
+
+If you use wall-clock time for a deadline, the clock adjustment can make a timeout expire too early or too late.
+
+`CLOCK_MONOTONIC` is not affected by normal wall-clock corrections.
+
+### 11.2 Convert to milliseconds
+
+```
+uint64_t monotonic_ms(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return 0; // In production, propagate the error.
+
+    return (uint64_t)ts.tv_sec * 1000 +
+           (uint64_t)ts.tv_nsec / 1000000;
+}
+```
+
+### 11.3 Where should you use it?
+
+| Purpose                       | Clock           |
+| ----------------------------- | --------------- |
+| Per-hop timeout               | CLOCK_MONOTONIC |
+| Overall query deadline        | CLOCK_MONOTONIC |
+| Cache TTL expiration          | CLOCK_MONOTONIC |
+| Performance measurement       | CLOCK_MONOTONIC |
+| Human-readable log timestamps | CLOCK_REALTIME  |
+
+One nuance: Linux also provides `CLOCK_BOOTTIME`, which includes time spent suspended. For your normal running resolver, `CLOCK_MONOTONIC` is appropriate.
+
+Your implementation already uses `CLOCK_MONOTONIC`, which is good.
+
+# Final Part A — Concept-to-interface mapping
+
+This is the revision table I would keep open while implementing your resolver.
+
+| Concept              | C structure / function       | OS interface                                     |
+| -------------------- | ---------------------------- | ------------------------------------------------ |
+| Client query         | `pending_query`              | `recvfrom()`                                     |
+| Client endpoint      | `sockaddr_in`                | `recvfrom()`                                     |
+| DNS header           | Byte buffer                  | None                                             |
+| DNS question         | `qname`, `qtype`, `qclass`   | None                                             |
+| DNS RR               | `parsed_rr`                  | None                                             |
+| Name compression     | `decode_name()`              | None                                             |
+| Transaction ID       | `uint16_t`                   | `getrandom()`                                    |
+| Pending lookup       | Hash table / array           | None                                             |
+| DNS cache            | Hash table + LRU             | `clock_gettime()`                                |
+| Cache expiration     | `expires_at_ms`              | `CLOCK_MONOTONIC`                                |
+| Nameserver selection | `delegation`, `ns_candidate` | `sendto()`                                       |
+| Upstream response    | Parsed response              | `recvfrom()`                                     |
+| Parent-child lookup  | Pending-query IDs            | None                                             |
+| UDP socket           | File descriptor              | `socket()`                                       |
+| Socket binding       | `sockaddr_in`                | `bind()`                                         |
+| Event registration   | `epoll_event`                | `epoll_ctl()`                                    |
+| Event waiting        | Event array                  | `epoll_wait()`                                   |
+| Upstream failover    | Candidate index              | `sendto()`                                       |
+| Deadline handling    | Min-heap / scan              | `epoll_wait()` timeout                           |
+| Client response      | DNS output buffer            | `sendto()`                                       |
+| Packet truncation    | TC flag                      | TCP fallback (not implemented in UDP-only scope) |
+
+## Recommended function interfaces
+
+These are the interfaces I would aim to implement. They are not a complete implementation; they establish clean boundaries between responsibilities.
+
+### DNS packet layer
+
+```
+int parse_dns_header(
+    const uint8_t *packet,
+    size_t packet_len,
+    struct dns_header *header
+);
+
+int decode_dns_name(
+    const uint8_t *packet,
+    size_t packet_len,
+    size_t *offset,
+    char *output,
+    size_t output_size
+);
+
+int encode_dns_name(
+    const char *name,
+    uint8_t *buffer,
+    size_t buffer_size
+);
+
+int parse_dns_question(
+    const uint8_t *packet,
+    size_t packet_len,
+    size_t *offset,
+    struct dns_question *question
+);
+
+int parse_dns_rr(
+    const uint8_t *packet,
+    size_t packet_len,
+    size_t *offset,
+    struct dns_rr *rr
+);
+
+int build_dns_query(
+    uint8_t *buffer,
+    size_t buffer_size,
+    uint16_t txid,
+    const char *qname,
+    uint16_t qtype
+);
+```
+
+### Cache layer
+
+```
+struct cache_entry *cache_lookup(
+    const char *name,
+    uint16_t type,
+    uint16_t class
+);
+
+int cache_insert(
+    const char *name,
+    uint16_t type,
+    uint16_t class,
+    const struct dns_rr *records,
+    size_t count
+);
+
+void cache_evict_expired(void);
+void cache_evict_lru(void);
+```
+
+### Resolution layer
+
+```
+struct pending_query *pending_alloc(void);
+
+void pending_release(
+    struct pending_query *query
+);
+
+int resolution_start(
+    struct pending_query *query
+);
+
+void resolution_handle_response(
+    struct pending_query *query,
+    const struct parsed_response *response
+);
+
+void resolution_handle_timeout(
+    struct pending_query *query
+);
+
+int resolution_try_next_ns(
+    struct pending_query *query
+);
+
+int resolution_start_child(
+    struct pending_query *parent,
+    const char *nameserver_name
+);
+```
+
+### Transport layer
+
+```
+int upstream_socket_create(void);
+
+int upstream_send(
+    struct pending_query *query,
+    const struct sockaddr_in *destination
+);
+
+void upstream_receive_all(void);
+
+void client_receive_all(void);
+```
+
+The most important architectural separation is:
+
+```
+Transport:
+    Receives and sends packets.
+
+Parser:
+    Converts packet bytes into DNS objects.
+
+Resolution engine:
+    Decides what to do with responses.
+
+Cache:
+    Stores and retrieves DNS information.
+
+Response builder:
+    Creates the response sent to clients.
+```
+
+Do not let your socket-reading function decide DNS semantics.
+
+# Final Part B — Review of your attached implementation
+
+I reviewed the uploaded `recursive_resolver.c`, including the event loop and response-handling sections.
+
+First, there is a distinction worth preserving in your project documentation:
+
+Your code calls itself a recursive resolver, but its current upstream algorithm is iterative. It provides a recursive-style service to the client by performing the iteration itself. It is not yet a complete recursive resolver.
+
+Here is the specific review.
+
+## 1. What you have implemented correctly
+
+Good foundations
+
+| Component            | Your implementation        | Assessment                         |
+| -------------------- | -------------------------- | ---------------------------------- |
+| DNS header           | Manual byte parsing        | Good approach                      |
+| DNS name compression | Pointer following          | Good foundation                    |
+| Name normalization   | Lowercase names            | Good                               |
+| Root hints           | Static IPv4 addresses      | Appropriate simplification         |
+| Iterative resolution | Root → TLD → authoritative | Correct basic architecture         |
+| CNAME following      | Separate target lookup     | Basic implementation               |
+| Cache                | Hash buckets               | Good foundation                    |
+| Cache expiration     | Monotonic absolute expiry  | Correct concept                    |
+| LRU intention        | Doubly linked pointers     | Partially implemented              |
+| Pending queries      | Fixed-size array           | Appropriate for first version      |
+| Nonblocking UDP      | `SOCK_NONBLOCK`            | Good                               |
+| Event loop           | epoll                      | Good                               |
+| Deadline tracking    | Per-hop and overall        | Good concept                       |
+| TXID randomness      | `getrandom()`              | Good choice, fallback needs fixing |
+
+Relevant source locations: DNS name handling around lines 108–207, cache around lines 209–358, pending state around lines 361–414, and event loop around lines 1054–1294.&#x20;
+
+Pasted markdown(2).md
+
+
+
+## 2. Critical correctness bugs
+
+These are the things I would fix before benchmarking the normal recursive mode.
+
+High priority
+
+Bug 1: Your upstream queries set RD=1
+
+At lines 671–695:
+
+```
+buf[2] = 0x01; // RD=1
+```
+
+You are performing iterative resolution, so upstream queries should normally have:
+
+```
+buf[2] = 0x00; // RD=0
+```
+
+You are asking root and TLD servers for referrals, not asking them to recursively resolve the name.
+
+Bug 2: Upstream response matching is insufficient
+
+At lines 407–414 and 1227–1240, you match using TXID and source IP.
+
+Missing:
+
+- Source port validation.
+- Question name validation.
+- Question type validation.
+- Question class validation.
+- Unique outstanding TXID enforcement.
+
+This is a correctness and security problem.
+
+Bug 3: CNAME RDATA can become invalid when copied
+
+At lines 827–832, you copy the raw CNAME RDATA into your cache.
+
+A compressed CNAME target may contain a pointer into the original DNS packet.
+
+For example:
+
+```
+CNAME RDATA = C0 10
+```
+
+That pointer refers to an offset in the original packet.
+
+When you construct a new response, offset `0x10` refers to a different location!
+
+You must decode the target into a hostname and re-encode it when constructing a new packet.
+
+This is one of the most important bugs to fix.
+
+Bug 4: You don't correctly construct CNAME responses
+
+At lines 863–907, you change `pq->qname` to the CNAME target and restart resolution.
+
+But when the target resolves, you construct the response using the target name.
+
+The original CNAME record is not properly included in the final client response.
+
+You should preserve the original question and accumulate the CNAME chain.
+
+Bug 5: AAAA parsing is incomplete
+
+Your parser handles A records:
+
+```
+if (type == DNS_TYPE_A && rdlen == 4)
+```
+
+But doesn't decode AAAA records into an IPv6 representation.
+
+Raw RDATA can be stored, but you must validate:
+
+```
+A     → RDLENGTH = 4
+AAAA  → RDLENGTH = 16
+```
+
+Your response processing must also handle AAAA correctly.
+
+Bug 6: Cache TTL is incorrectly returned
+
+At lines 602–603:
+
+```
+buf[pos++] = 0;
+buf[pos++] = 0;
+buf[pos++] = 0;
+buf[pos++] = 60;
+```
+
+Every cached answer is returned with TTL 60.
+
+Instead, calculate remaining TTL from `expire_ms`.
+
+Otherwise, a cached record can effectively be refreshed indefinitely by repeated responses.
+
+Bug 7: Cache key is incomplete
+
+Your cache hash and lookup use:
+
+```
+name + qtype
+```
+
+You omit QCLASS.
+
+Use:
+
+```
+name + qtype + qclass
+```
+
+You also need a proper mechanism for CNAME lookup when the original query is A or AAAA.
+
+Bug 8: Referral classification is too broad
+
+At lines 912–913:
+
+```
+if (resp->ns_count > 0 && resp->an_count == 0)
+```
+
+This is not sufficient to identify a referral.
+
+You must verify:
+
+- NS record type and class.
+- Delegation owner is an ancestor of the requested name.
+- Correct authority relationship.
+- No authoritative negative response is being mistaken for a referral.
+
+Bug 9: No bailiwick validation
+
+At lines 937–950, you match the NS hostname against Additional-section A records.
+
+You do not establish whether that glue belongs to the delegation.
+
+An unrelated Additional-section record should not automatically become a trusted nameserver address or cache entry.
+
+Bug 10: No glueless delegation support
+
+At lines 954–974, you explicitly skip nameservers without glue or a cached address.
+
+This means the resolver can fail on a perfectly legitimate delegation even when the nameserver address could be discovered using another lookup.
+
+You need the parent-child pending-query design.
+
+## 3. Important architectural and performance gaps
+
+| Issue               | Current implementation           | Recommended change                               |
+| ------------------- | -------------------------------- | ------------------------------------------------ |
+| Pending lookup      | Linear TXID scan                 | Hash lookup                                      |
+| Upstream sockets    | One shared socket                | Randomized source-port pool or per-query sockets |
+| NS selection        | First usable glue                | Multiple addresses and failover                  |
+| Root failover       | Random root restart              | Track root candidates and retries                |
+| Glueless delegation | Skip                             | Child lookup                                     |
+| Negative cache      | NXDOMAIN only                    | NXDOMAIN + NODATA                                |
+| SOA parsing         | Last four bytes assumed MINIMUM  | Proper SOA parser                                |
+| Cache eviction      | Earliest-expiring entry          | Actual LRU                                       |
+| Cache expiry        | Expired entries remain in bucket | Remove on lookup                                 |
+| TTL response        | Fixed 60                         | Remaining TTL                                    |
+| CNAME chain         | Target-only response issue       | Accumulate chain                                 |
+| EDNS                | Not implemented                  | OPT record                                       |
+| Truncation          | TC not handled                   | Detect and fail over; TCP is outside scope       |
+| Receive handling    | One datagram per event           | Drain until EAGAIN                               |
+| Deadlines           | 100 ms periodic scan             | Nearest-deadline timeout or heap                 |
+
+There are also some specific implementation defects worth noting:
+
+- `cache_insert()` updates `e->rr_count` before limiting `rr_count` to `MAX_CACHED_RRS` in the update-existing-entry path. This can leave an invalid record count.
+- Your LRU initialization and insertion do not maintain a proper circular sentinel list. More importantly, eviction currently scans for earliest expiry rather than selecting the LRU tail.
+- Expired cache entries are returned as misses but not removed from their hash bucket.
+- `parse_dns_name()` uses a pointer-count limit rather than tracking visited offsets. It also doesn't enforce the expanded wire-name length limit.
+- `parse_rr_section()` checks packet boundaries but your NS/CNAME RDATA name parser does not enforce the RDLENGTH consumption boundary.
+- `send_to_ns()` ignores the result of `sendto()`. An EAGAIN or other send error can leave the state inconsistent.
+- If building an upstream query fails, the pending entry is released without sending a failure response to the client.
+- The upstream receive path validates the source IP but not source port or the complete question.
+- Your timeout checker restarts at a random root when the nameserver list is exhausted. It doesn't maintain a proper root retry list.
+- Your response builder hardcodes RD=1 and RA=1 rather than correctly preserving the client's RD bit and advertising the server's actual recursion capability.
+- The response builder doesn't preserve the original CNAME chain and always assigns a fixed TTL.
+
+Relevant code sections: cache lines 270–358, query building and upstream sending lines 663–752, response processing lines 776–1050, and response construction lines 555–619.&#x20;
+
+Pasted markdown(2).md
+
+
+
+## 4. My recommended implementation priority
+
+Don't try to fix everything simultaneously.
+
+| Priority | Work                                                 |
+| -------- | ---------------------------------------------------- |
+| 1        | Correct upstream query flags and response validation |
+| 2        | Fix DNS name and RR parsing boundaries               |
+| 3        | Correct A/AAAA and CNAME response construction       |
+| 4        | Correct TTL handling and cache semantics             |
+| 5        | Correct referral classification and bailiwick        |
+| 6        | Implement proper nameserver failover                 |
+| 7        | Implement glueless child queries                     |
+| 8        | Implement source-port randomization                  |
+| 9        | Implement EDNS and TC handling                       |
+| 10       | Optimize pending lookup and deadline handling        |
+
+One thing I would strongly recommend: retain your `--local` mode. It is useful for benchmarking cache lookup, client socket processing and response construction independently of Internet latency.
+
+But report local-mode performance separately from real upstream recursive-resolution performance.
+
+# Final Part C — 10-question understanding quiz
+
+Try answering these without looking at the explanations first.
+
+DNS resolver knowledge check
+
+0/10 answered
+
+1\. A resolver has 500 outstanding queries. Why is TXID alone insufficient to identify an upstream response?
+
+TXID is 32 bits
+
+Multiple queries can have the same TXID, and source/question validation is required
+
+DNS doesn't use TXIDs
+
+TXID identifies the domain
+
+2\. What should happen when a cached record has 40 seconds of TTL remaining?
+
+Return its original TTL
+
+Return TTL=60
+
+Return TTL=40
+
+Return TTL=0
+
+3\. example.com has an A record but no AAAA record. The AAAA query returns NOERROR and an empty Answer section. What is this?
+
+NXDOMAIN
+
+NODATA
+
+SERVFAIL
+
+Referral
+
+4\. A referral contains ns1.otherdomain.net but no glue. What should a capable resolver do?
+
+Return NXDOMAIN
+
+Always restart at root for the original name
+
+Spawn a child lookup for the NS hostname's address
+
+Assume the hostname is its IP
+
+5\. Which field identifies the actual owner name of an NS resource record?
+
+TYPE
+
+CLASS
+
+NAME
+
+TTL
+
+6\. What does the DNS compression pointer C0 10 represent?
+
+IPv4 address 192.0.0.16
+
+A pointer to offset 16 in the DNS message
+
+A 16-byte name
+
+A TTL of 16
+
+7\. Why is a single shared upstream UDP socket weaker against DNS spoofing?
+
+It cannot receive multiple datagrams
+
+All queries share the same source port
+
+It cannot use TXIDs
+
+It prevents caching
+
+8\. What should the resolver do when TC=1?
+
+Accept the incomplete answer
+
+Set TTL to zero
+
+Use TCP fallback or, under your UDP-only restriction, try another server or fail
+
+Treat it as NXDOMAIN
+
+9\. Why use CLOCK_MONOTONIC for cache expiration?
+
+It returns UTC
+
+It is unaffected by ordinary wall-clock adjustments
+
+It provides DNS server time
+
+It is faster than every other clock
+
+10\. A referral for example.com contains an Additional A record for bank.com. Should you automatically cache it?
+
+Yes, all Additional records are trusted
+
+Yes, because it is an A record
+
+No, it is outside the relevant delegation's bailiwick
+
+Only if TTL is 60
+
+Submit answers
+
+# What I would do next
+
+Before writing more code, I would make sure you can explain these five things from memory:
+
+1. Why a pending query must preserve both the original question and current resolution target.
+2. Why a DNS cache needs RRset-specific TTLs and negative caching.
+3. Why a glueless delegation requires a parent-child query relationship.
+4. Why DNS response classification requires examining resource records, not just header counts.
+5. Why source-port randomization, response matching and bailiwick checking are separate security requirements.
+
+Once these are clear, your implementation becomes much more mechanical.
+
+My strongest recommendation: implement the corrected pending-query structure and response-validation layer first. Those two pieces form the foundation on which all the more advanced functionality—CNAME chains, glueless delegations, failover and caching—depends.
