@@ -1,0 +1,938 @@
+in af_xdp, dns resolver implementation, is the total no of rings 4 or 4 per socket
+
+In AF_XDP, the standard setup has 4 rings per AF_XDP socket, not 4 rings shared across the entire application.
+
+The four rings are:
+
+1. RX ring – Kernel → User space: delivers received packet descriptors.
+2. TX ring – User space → Kernel/NIC: sends packet descriptors for transmission.
+3. FILL ring – User space → Kernel: supplies empty UMEM buffers for receiving packets.
+4. COMPLETION ring – Kernel → User space: tells the application which transmitted UMEM buffers can be reused.
+
+Important distinction: RX/TX rings belong to the socket, whereas FILL/COMPLETION rings belong to the UMEM.
+
+For a single socket with its own UMEM:
+
+UMEM
+
+Packet buffer memory
+
+FILL ring
+
+COMPLETION ring
+
+AF_XDP Socket
+
+RX ring
+
+TX ring
+
+Example:
+
+| Configuration                       | Total rings |
+| ----------------------------------- | ----------- |
+| 1 socket + 1 UMEM                   | 4           |
+| 2 sockets + separate UMEMs          | 8           |
+| 2 sockets + shared UMEM, same queue | 6           |
+| 4 sockets + shared UMEM, same queue | 10          |
+
+For shared UMEM on the same queue, you have one FILL and one COMPLETION ring, but each socket has its own RX and TX rings.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://docs.kernel.org\&sz=32)
+
+The Linux Kernel documentation+1
+
+
+
+For your DNS resolver: If your implementation creates just one AF_XDP socket and one UMEM, you have four rings total.
+
+One subtlety: if you create multiple sockets sharing the same UMEM but bind them to different queue IDs, you need a separate FILL/COMPLETION pair per unique device/queue combination.
+
+it only consists of those redirected right?
+
+Yes. In your AF_XDP DNS resolver, the RX ring receives only packets that the XDP program redirects to that particular AF_XDP socket using `XDP_REDIRECT`.
+
+For example:
+
+```
+if (udp->dest == 53)
+    return bpf_redirect_map(&xsks_map, queue_id, 0);
+
+return XDP_PASS;
+```
+
+The flow is:
+
+- DNS packet (UDP destination port 53): XDP redirects it → AF_XDP socket → RX ring → userspace resolver.
+- Non-DNS packet: XDP returns `XDP_PASS` → continues through the normal kernel networking stack.
+- Dropped packet: XDP returns `XDP_DROP` → discarded; never reaches the RX ring.
+
+So, the RX ring is not a copy of the NIC's entire RX queue. It contains descriptors for packets successfully redirected to that AF_XDP socket.
+
+where is the rx queue
+
+The RX queue is inside the NIC/driver's receive path, before the XDP program redirects anything to AF_XDP.
+
+There are two distinct things:
+
+- NIC RX queue: Hardware/driver-level receive queue that receives incoming packets.
+- AF_XDP RX ring: Software ring through which userspace receives descriptors for redirected packets.
+
+### Complete packet flow
+
+```
+             NETWORK
+                |
+                v
+          +-----------+
+          |    NIC    |
+          +-----------+
+                |
+                v
+       +-----------------+
+       | NIC RX Queue    |
+       | (Hardware Queue)|
+       +-----------------+
+                |
+                v
+       +-----------------+
+       | XDP Program     |
+       |                 |
+       | UDP dst port 53?|
+       +-----------------+
+          /     |      \
+         /      |       \
+   XDP_PASS  XDP_DROP  XDP_REDIRECT
+      |         |          |
+      v         v          v
+ Kernel       Discard   AF_XDP Socket
+ Network                    |
+ Stack                      v
+                        RX Ring
+                            |
+                            v
+                         Userspace
+                       DNS Resolver
+```
+
+### Key distinction
+
+| NIC RX queue                       | AF_XDP RX ring                          |
+| ---------------------------------- | --------------------------------------- |
+| Receives incoming packets from NIC | Receives redirected packet descriptors  |
+| Managed by NIC/driver              | Shared between kernel and userspace     |
+| Exists independently of AF_XDP     | Exists when AF_XDP socket is configured |
+
+One important detail: XDP executes in the driver's RX processing path, typically before the normal kernel network stack processes the packet. It is not executed after the packet enters the AF_XDP RX ring.
+
+The considered this that we have four DNS packets, four queries, and the system is like there are like four rings per socket. One socket is there, and each human memory space has only three frames. Now using the simplified diagram, explain the whole process how the four DNS queries are done, and go through each and every ring, each and every diagram.
+
+Let's walk through this using 4 DNS queries, 1 AF_XDP socket, 1 UMEM, and 4 rings.
+
+We'll assume:
+
+- Four DNS query packets arrive from the network.
+- All four are UDP packets with destination port 53.
+- One AF_XDP socket is bound to the NIC's RX queue.
+- UMEM has only 3 frames available.
+- Each frame can hold one packet.
+- We use XDP redirect and AF_XDP copy mode for this example.
+
+The interesting part is that 4 packets arrive, but UMEM can accommodate only 3 at a time. This is where the FILL and COMPLETION rings become important.
+
+## 1. First, understand our memory and rings
+
+There are four rings, but they do different jobs.
+
+AF_XDP socket
+
+UMEM – 3 frames
+
+F0
+
+Frame 0
+
+F1
+
+Frame 1
+
+F2
+
+Frame 2
+
+FILL ring
+
+Empty frame addresses supplied to kernel
+
+COMPLETION ring
+
+TX frames returned for reuse
+
+RX ring
+
+Received packet descriptors
+
+TX ring
+
+Packet descriptors to transmit
+
+One correction to keep in mind: the FILL ring doesn't contain the actual DNS queries. It contains addresses of available UMEM frames. The RX ring contains descriptors pointing to frames holding received packets.
+
+## 2. Initialisation: FILL ring is populated
+
+Before packets arrive, userspace allocates three UMEM frames and submits their addresses to the FILL ring.
+
+```
+       USERSPACE
+           |
+           | Supplies 3 empty frame addresses
+           v
+      +-----------+
+      | FILL RING |
+      +-----------+
+        [F0][F1][F2]
+           |
+           | Kernel consumes addresses
+           v
+      +----------------+
+      | UMEM (3 frames)|
+      +----------------+
+```
+
+At this point:
+
+- F0, F1, F2 are available for receiving packets.
+- FILL ring has supplied all three addresses.
+- No DNS packets have arrived yet.
+- RX ring is empty.
+
+## 3. Four DNS queries arrive at the NIC
+
+Let's call the queries Q1, Q2, Q3 and Q4.
+
+They arrive at the NIC's RX queue.
+
+```
+        NETWORK
+           |
+     +-----------+
+     | NIC RX Q  |
+     +-----------+
+           |
+     +-----------+
+     | XDP PROGRAM|
+     +-----------+
+           |
+      XDP_REDIRECT
+           |
+     AF_XDP SOCKET
+```
+
+Since all four packets are DNS queries, XDP redirects them to the AF_XDP socket.
+
+Now the kernel needs available UMEM frames to place the received packets.
+
+## 4. First three queries enter UMEM
+
+The kernel takes the three available addresses from the FILL ring.
+
+UMEM after receiving Q1, Q2, Q3
+
+F0
+
+Q1
+
+F1
+
+Q2
+
+F2
+
+Q3
+
+No free frames remaining
+
+The kernel publishes three descriptors in the RX ring.
+
+```
+FILL RING
+   [F0] [F1] [F2]
+      |
+      | Kernel consumes all three
+      v
+UMEM
+   F0 = Q1
+   F1 = Q2
+   F2 = Q3
+      |
+      | Kernel publishes descriptors
+      v
+RX RING
+   [descriptor F0]
+   [descriptor F1]
+   [descriptor F2]
+```
+
+Notice the distinction:
+
+- UMEM holds the actual packet data.
+- RX ring holds descriptors containing information such as the UMEM address and packet length.
+- The RX ring does not hold another copy of the packet.
+
+## 5. What happens to Q4?
+
+The fourth query arrives, but there are no more available frames in the FILL ring.
+
+```
+Q4 arrives
+    |
+    v
+XDP_REDIRECT
+    |
+    v
+AF_XDP SOCKET
+    |
+    v
+Need a UMEM frame
+    |
+    v
+FILL RING EMPTY
+    |
+    v
+No available buffer
+```
+
+Q4 cannot be delivered to userspace at this moment. With no receive buffer available, the packet is dropped by the AF_XDP receive path.
+
+It is not stored in the RX ring waiting for a frame.
+
+The client may retransmit Q4 later.
+
+This is the first important lesson: the number of frames in UMEM can limit how many packets you can receive before recycling buffers.
+
+## 6. Userspace DNS resolver consumes the RX ring
+
+Now the userspace application polls the RX ring.
+
+It sees:
+
+| RX descriptor | UMEM address | Packet |
+| ------------- | ------------ | ------ |
+| D1            | F0           | Q1     |
+| D2            | F1           | Q2     |
+| D3            | F2           | Q3     |
+
+The application accesses the actual packet bytes using those UMEM addresses.
+
+For each query, it:
+
+1. Reads Ethernet, IP and UDP headers.
+2. Extracts the DNS message.
+3. Parses the DNS question.
+4. Performs DNS resolution.
+5. Constructs a DNS response.
+
+For simplicity, assume all three queries are successfully resolved.
+
+## 7. The resolver sends DNS responses: TX ring
+
+Let's process Q1 first.
+
+The application has read Q1 from F0. Once it has finished using the incoming packet data, it can reuse F0 to construct the DNS response.
+
+```
+       USERSPACE DNS RESOLVER
+                 |
+                 | Constructs response for Q1
+                 v
+             UMEM F0
+          [DNS RESPONSE 1]
+                 |
+                 | Publishes descriptor
+                 v
+             TX RING
+          [descriptor F0]
+                 |
+                 v
+          KERNEL / DRIVER
+                 |
+                 v
+               NIC
+                 |
+                 v
+          DNS CLIENT 1
+```
+
+The TX ring contains the descriptor pointing to the response in F0. The actual response bytes are still in UMEM.
+
+The kernel/driver consumes the TX descriptor and transmits the packet.
+
+## 8. COMPLETION ring: what happens after transmission?
+
+Once the kernel has finished transmitting the packet, it returns the TX buffer address through the COMPLETION ring.
+
+```
+       TX RING
+           |
+           v
+      KERNEL / NIC
+           |
+           | Packet transmitted
+           v
+   COMPLETION RING
+           |
+           | Returns F0
+           v
+       USERSPACE
+           |
+           v
+      F0 available
+```
+
+The userspace application consumes the completion entry and regains ownership of F0.
+
+It can now put F0's address back into the FILL ring.
+
+```
+COMPLETION RING
+       |
+       | F0 returned
+       v
+USERSPACE
+       |
+       | Recycles F0
+       v
+FILL RING
+       |
+       | Kernel can use F0 again
+       v
+UMEM
+```
+
+Important: COMPLETION is specifically for returning transmitted buffers. It does not automatically recycle received buffers. Userspace manages that process.
+
+## 9. Now Q4 can be received
+
+Suppose Q4's client retransmits after the earlier drop.
+
+By now, F0 has been returned to the FILL ring.
+
+```
+       FILL RING
+          [F0]
+            |
+            v
+        UMEM F0
+            |
+            v
+       XDP_REDIRECT
+            |
+            v
+         RX RING
+            |
+            v
+       USERSPACE
+            |
+            v
+       DNS RESOLVER
+```
+
+The resolver processes Q4, constructs response 4, and submits it through the TX ring.
+
+The same process repeats:
+
+```
+UMEM F0
+   |
+   v
+TX RING
+   |
+   v
+NIC transmits response
+   |
+   v
+COMPLETION RING
+   |
+   v
+USERSPACE recycles F0
+   |
+   v
+FILL RING
+```
+
+## 10. All four rings: complete lifecycle
+
+Here is the complete picture of what each ring does in your example.
+
+## AF_XDP packet lifecycle
+
+1\. FILL RING
+
+User → Kernel
+
+Supplies empty UMEM frame addresses.
+
+2\. UMEM
+
+Shared packet memory
+
+Holds the actual incoming DNS queries and outgoing DNS responses.
+
+3\. RX RING
+
+Kernel → User
+
+Delivers descriptors for received DNS queries.
+
+USERSPACE DNS RESOLVER
+
+Parses query → resolves domain → constructs response
+
+4\. TX RING
+
+User → Kernel
+
+Submits response descriptors for transmission.
+
+NIC transmits DNS response
+
+5\. COMPLETION RING
+
+Kernel → User
+
+Returns transmitted buffer addresses for reuse.
+
+Recycled frames go back into FILL ring.
+
+## 11. Final state of our four queries
+
+| Query | UMEM frame    | Received?   | Response transmitted? |
+| ----- | ------------- | ----------- | --------------------- |
+| Q1    | F0            | Yes         | Yes                   |
+| Q2    | F1            | Yes         | Yes                   |
+| Q3    | F2            | Yes         | Yes                   |
+| Q4    | F0 (recycled) | After retry | Yes                   |
+
+All four queries eventually get processed, assuming Q4's client retransmits.
+
+## 12. The most important concepts to remember
+
+| Ring       | Direction     | What travels through it?     |
+| ---------- | ------------- | ---------------------------- |
+| FILL       | User → Kernel | Empty buffer addresses       |
+| RX         | Kernel → User | Incoming packet descriptors  |
+| TX         | User → Kernel | Outgoing packet descriptors  |
+| COMPLETION | Kernel → User | Transmitted buffer addresses |
+
+One final distinction about your three-frame example: Three frames do not mean you can only process three DNS queries in total. They limit how many buffers you can have occupied simultaneously. You can process thousands of queries by continually recycling those three frames, provided the application and network can keep up.
+
+In a real iterative DNS resolver, upstream DNS requests and their replies also use packet buffers and the TX/RX paths. We've deliberately left those out here to isolate the AF_XDP ring mechanics.
+
+bind_socket(
+        xsk,
+        interface = interface,
+        queue_id = 0
+    )
+
+    # 7. Load and attach the XDP eBPF program.
+    program = load_XDP_program()
+    attach_XDP_program(interface, program)
+
+    # 8. Add the socket to the XSKMAP.
+    update_XSKMAP(
+        key = 0,
+        value = xsk
+    )
+
+Does every socket have its own isntance of cdp program running
+
+No. The XDP eBPF program is not instantiated separately for every AF_XDP socket.
+
+The distinction is between the XDP program, AF_XDP sockets, and the XSKMAP.
+
+### 1. One XDP program can serve multiple sockets
+
+For example, suppose you have two AF_XDP sockets:
+
+```
+              NIC
+               |
+          RX Queue 0
+               |
+               v
+       +----------------+
+       | XDP eBPF       |
+       | Program        |
+       | (one instance) |
+       +----------------+
+               |
+          XSKMAP lookup
+           /       \
+          /         \
+      Key 0        Key 1
+        |             |
+        v             v
+    Socket 0      Socket 1
+    Queue 0       Queue 1
+```
+
+The same attached XDP program processes packets arriving on the interface and redirects them to the appropriate socket.
+
+### 2. What happens in your code?
+
+```
+program = load_XDP_program()attach_XDP_program(interface, program)
+```
+
+This loads and attaches an XDP program to the network interface.
+
+```
+update_XSKMAP(    key=0,    value=xsk)
+```
+
+This inserts the AF_XDP socket into the XSKMAP at key 0.
+
+The XDP program can then use that map to redirect packets:
+
+```
+return bpf_redirect_map(&xsks_map, queue_id, 0);
+```
+
+Here, `queue_id` is used as the XSKMAP key in this example.
+
+### 3. What if you create four sockets?
+
+| Component                         | Number                                          |
+| --------------------------------- | ----------------------------------------------- |
+| XDP program attached to interface | 1                                               |
+| AF_XDP sockets                    | 4                                               |
+| RX/TX rings                       | 4 pairs                                         |
+| XSKMAP entries                    | Up to 4                                         |
+| FILL/COMPLETION rings             | Depends on UMEM sharing and queue configuration |
+
+Remember this distinction:
+
+- XDP program: decides where packets go.
+- XSKMAP: maps keys to AF_XDP sockets.
+- AF_XDP socket: receives and transmits packets through its rings.
+
+Think of the XDP program as one traffic controller directing packets to multiple AF_XDP sockets.
+
+Wont one program make it asynchronous?
+
+No. Having one XDP program does not make the system synchronous or asynchronous. The number of XDP program instances and the concurrency of packet processing are two different things.
+
+The important thing is that XDP executes in the NIC driver's receive-processing context, not as one continuously running application thread.
+
+### 1. How one XDP program handles multiple packets
+
+Suppose four DNS packets arrive:
+
+```
+          NIC RX QUEUES
+          Q1 Q2 Q3 Q4
+               |
+               v
+        +--------------+
+        | XDP PROGRAM  |
+        | Same program |
+        +--------------+
+               |
+          XSKMAP lookup
+          /    |    \
+         v     v     v
+       XSK0   XSK1  XSK2
+```
+
+The same loaded XDP program can be executed many times for different packets.
+
+It doesn't mean one execution handles all four packets sequentially.
+
+### 2. Where does concurrency come from?
+
+Primarily from multiple RX queues and CPU processing.
+
+For example:
+
+Two RX queues, two CPUs
+
+CPU 0
+
+RX Queue 0
+
+XDP execution for Q1, Q2
+
+AF_XDP Socket 0
+
+CPU 1
+
+RX Queue 1
+
+XDP execution for Q3, Q4
+
+AF_XDP Socket 1
+
+One attached XDP program, executed independently in different receive-processing contexts.
+
+Both CPUs can execute the same XDP program concurrently.
+
+### 3. What about your DNS resolver?
+
+There are two separate stages:
+
+| Stage                                | Concurrency                                    |
+| ------------------------------------ | ---------------------------------------------- |
+| XDP packet filtering and redirection | Can execute concurrently across RX queues/CPUs |
+| Userspace DNS resolution             | Depends on your worker/thread architecture     |
+
+For example, your userspace resolver could have:
+
+- One socket and one processing thread: largely sequential processing.
+- Multiple sockets and multiple worker threads: parallel processing.
+- One socket with a multithreaded application: possible, but requires careful coordination around ring ownership.
+
+The key takeaway: One XDP program does not imply one execution thread. The XDP program is shared code; multiple CPUs can execute it concurrently. Your userspace resolver's parallelism is a separate architectural decision.
+
+ALso when we make recursive queries, what networking stack does it pass through
+
+In your AF_XDP DNS resolver, recursive DNS queries that your resolver sends to upstream DNS servers generally pass through the normal Linux networking stack, not through your AF_XDP RX/TX rings.
+
+This is an important distinction because your project is replacing the networking path for DNS packets arriving at your resolver, but it doesn't automatically replace the networking path used for outgoing recursive queries.
+
+Let's trace both directions.
+
+## 1. Incoming DNS query from a client
+
+Suppose a client asks your resolver for `www.example.com`.
+
+```
+CLIENT
+   |
+   | DNS query (UDP port 53)
+   v
+NIC RX QUEUE
+   |
+   v
+XDP PROGRAM
+   |
+   | XDP_REDIRECT
+   v
+AF_XDP RX RING
+   |
+   v
+USERSPACE DNS RESOLVER
+```
+
+The incoming query bypasses the normal kernel UDP/IP socket receive path.
+
+## 2. Resolver sends a recursive query upstream
+
+Suppose your resolver needs to contact a root DNS server.
+
+Your userspace resolver constructs a DNS query and sends it using a normal UDP socket.
+
+The outgoing packet follows:
+
+```
+USERSPACE DNS RESOLVER
+          |
+          | sendto()
+          v
+    UDP SOCKET
+          |
+          v
+    KERNEL NETWORK STACK
+          |
+          v
+      UDP / IP
+          |
+          v
+    ROUTING / NEIGHBOUR
+          |
+          v
+     DRIVER TX QUEUE
+          |
+          v
+         NIC
+          |
+          v
+    ROOT DNS SERVER
+```
+
+## 3. What happens when the upstream server responds?
+
+This is where the two networking paths meet.
+
+The root server sends its response back to your resolver.
+
+```
+ROOT DNS SERVER
+       |
+       | DNS response
+       v
+NIC RX QUEUE
+       |
+       v
+XDP PROGRAM
+       |
+       | Destination port = ephemeral port
+       | Not 53 → XDP_PASS
+       v
+NORMAL KERNEL NETWORK STACK
+       |
+       v
+UDP SOCKET
+       |
+       v
+USERSPACE DNS RESOLVER
+```
+
+Your resolver receives the response through its normal UDP socket.
+
+It can then send another query to a TLD server, followed by an authoritative DNS server.
+
+## 4. Complete architecture of your project
+
+## Two networking paths
+
+A. Client-facing path (AF_XDP)
+
+Client DNS query
+
+NIC RX → XDP → AF_XDP RX ring
+
+Userspace DNS resolver
+
+B. Upstream-facing path (normal UDP)
+
+Userspace DNS resolver
+
+UDP socket → Linux networking stack
+
+NIC TX → Root/TLD/Authoritative server
+
+Upstream response → NIC RX → XDP_PASS
+
+UDP socket → Userspace DNS resolver
+
+C. Client response (AF_XDP)
+
+Userspace DNS resolver
+
+UMEM → TX ring → NIC
+
+Client receives DNS response
+
+## 5. Does this mean we're only using AF_XDP partially?
+
+Yes. In this architecture:
+
+| Operation                     | Networking mechanism |
+| ----------------------------- | -------------------- |
+| Receive client DNS query      | AF_XDP               |
+| Parse DNS query               | Userspace            |
+| Send recursive upstream query | Normal UDP socket    |
+| Receive upstream response     | Normal UDP socket    |
+| Send response to client       | AF_XDP               |
+
+This is a perfectly reasonable hybrid architecture.
+
+Why this matters for your benchmarking:
+
+If you compare a UDP resolver against an AF_XDP resolver, remember that your upstream recursive resolution may still use normal UDP sockets in both implementations.
+
+You're primarily measuring the performance difference in the client-facing packet-processing path, not replacing the entire Linux networking stack.
+
+One important implementation detail: make sure your XDP program redirects only the intended client-facing DNS traffic. Upstream DNS replies need to reach their normal UDP sockets through `XDP_PASS`.
+
+Would it be significantly more complicated to handle iterative queries through AF_XDP instead of kernel networking stack?
+
+Your problem statement is referring to the fully AF_XDP architecture, not merely the hybrid architecture we discussed earlier.
+
+Look at these two phrases in the screenshot:
+
+> "sends and receives DNS packets using an AF_XDP (XSK) socket instead of the usual UDP/TCP socket."
+
+And:
+
+> "user-space resolver crafts raw Ethernet/IPv4/UDP/DNS frames, transmits them via the XSK TX ring and receives responses on the XSK RX ring."
+
+These indicate that both client-facing and upstream-facing DNS communication are intended to use AF_XDP.
+
+### What your project is expected to implement
+
+```
+          DNS CLIENT
+               |
+               v
+            NIC RX
+               |
+               v
+          XDP PROGRAM
+               |
+           XSK REDIRECT
+               |
+               v
+          AF_XDP RX RING
+               |
+               v
+       USERSPACE RESOLVER
+               |
+          Iterative logic
+               |
+       Construct raw DNS frame
+               |
+               v
+          AF_XDP TX RING
+               |
+               v
+              NIC
+               |
+               v
+          ROOT SERVER
+               |
+          DNS RESPONSE
+               |
+               v
+              NIC
+               |
+               v
+          XDP PROGRAM
+               |
+           XSK REDIRECT
+               |
+               v
+          AF_XDP RX RING
+               |
+               v
+       USERSPACE RESOLVER
+```
+
+The same process repeats for TLD and authoritative DNS servers.
+
+### Comparing the two architectures
+
+| Communication             | Hybrid     | Your problem statement |
+| ------------------------- | ---------- | ---------------------- |
+| Receive client query      | AF_XDP     | AF_XDP                 |
+| Send upstream query       | UDP socket | AF_XDP                 |
+| Receive upstream response | UDP socket | AF_XDP                 |
+| Send client response      | AF_XDP     | AF_XDP                 |
+
+### My recommendation
+
+Given the actual problem statement, I would revise my earlier recommendation:
+
+1. First implement a working iterative resolver using normal UDP sockets.
+2. Benchmark it.
+3. Implement AF_XDP packet reception and transmission.
+4. Move both client-facing and upstream-facing DNS traffic to AF_XDP.
+5. Benchmark again.
+
+You can retain the UDP implementation as your baseline.
+
+One important implication: Your AF_XDP implementation needs to handle routing, Ethernet headers, IP/UDP checksums and neighbour resolution for upstream communication. This is part of the additional plumbing your problem statement explicitly highlights.
+
+So yes, your teammate's proposed workflow makes sense, but the eventual target is a fully AF_XDP DNS data path.
+
+Can you place this whol conversation in a .md file and give me, everything must remain same word to wrd

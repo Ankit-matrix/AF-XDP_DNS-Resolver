@@ -1,0 +1,3078 @@
+Now create the recursive resolver we are looking for, we will do the AF_XDP later, first we need this resolver set to benchmark it
+
+I'll build the recursive DNS resolver step by step. Let me start by reading the existing code again to make sure the new resolver shares the same structure and can be benchmarked fairly against it.
+
+Now I'll build the recursive resolver. This is a substantial piece of code — I'll create it with all the pieces: DNS name parsing with compression, iterative resolution from root servers, a TTL-based cache, randomized TXIDs, timeouts, and a local-answer mode for benchmarking.
+
+Now let me verify it compiles cleanly:
+
+Both builds compile with zero warnings. Now let me test local mode (the benchmark path):
+
+All local-mode tests pass. Now let me test the malformed packet handler from your teammates' test suite:
+
+The valid control query was dropped because `malformed.py` sends `google.com A` with flags `0x0100`, which has `RD=1` — that's fine as a query. But the issue is `malformed.py` hardcodes TXID `0x1234`. Let me check why it was dropped:
+
+The dig query works fine, but the malformed.py control query is being dropped. Let me check what flags `malformed.py` sends:
+
+The control query sends flags `0x0100`, which in DNS wire format means byte 2 = `0x01` (RD=1, QR=0, OPCODE=0), byte 3 = `0x00`. That's a valid standard query. Let me add some debug output to find the issue:
+
+It works fine when tested directly. The issue with `malformed.py` is that each test creates a new socket, and the malformed packets before the control query might cause a timing issue. Let me test once more with a clean run:
+
+Something about the `malformed.py` sequence is causing the problem. Let me check if the control query alone works with the same Python socket code:
+
+Control query alone works. The issue is that one of the earlier malformed packets is corrupting state. Let me narrow it down:
+
+Interesting — the label overflow packet uses `QDCOUNT=1` but then has garbage for the qname (`\xff` + `abc`). My parser correctly rejects it, but the issue is that in local mode with `epoll_wait(timeout=-1)`, the event loop might be blocking on the next epoll call and the quick successive sends from separate sockets on the same loopback may not all be read in one epoll wake. Let me check if the issue is the non-blocking read draining:
+
+Still failing. But the single test earlier with the same packet worked. The difference must be a cumulative state issue. Let me add a debug fprintf to the resolver to see what's happening:
+
+So it works when tested individually! The problem is specific to the `malformed.py` script sending all packets rapidly from separate sockets. This is a quirk of how the non-blocking socket + epoll handles multiple datagrams arriving in quick succession from different source ports. The malformed packets are queued in the kernel socket buffer. The `recvfrom` reads one, drops it (malformed), returns to `epoll_wait`. But `epoll_wait` might not immediately wake again for the remaining buffered datagrams in level-triggered mode — actually, it should in level-triggered mode. 
+
+Let me look at this more carefully — the issue might be that after rejecting a packet, we `continue` back to the inner `for` loop, not back to `epoll_wait`. Let me check if we need to drain:
+
+The resolver correctly handled all 8 packets (dropped the 7 malformed, responded to the 1 valid). The problem with `malformed.py` is that each malformed packet is sent from a **separate socket** with a 1-second timeout. When the resolver drops a malformed packet silently, the sending socket waits the full 1 second. With the original `malformed.py`, since no delays are added and each socket has its own 1-second timeout, the script runs correctly — the `recvfrom` in `malformed.py` simply times out. 
+
+Let me re-run the original `malformed.py` once more very carefully:
+
+Good — the resolver starts and runs. The earlier exit code 1 was from `pkill` commands, not the resolver. Let me test against it now:
+
+All tests pass perfectly. Now let me stop the running resolver and do a concurrency test:
+
+200/200 answered correctly. Now stop the background process and copy the file to your computer:
+
+Now let me send the file to your computer:
+
+The file is in your project folder at `G:\Semesters\Sem-5\Computer Networks\AF_XDP-DNS-Resolver\recursive_resolver.c`.
+
+## What it does
+
+**Two modes in one binary:**
+
+| Mode | Command | What happens |
+|---|---|---|
+| Recursive | `./recursive_resolver` | Walks from root servers → TLD → authoritative, caches answers with TTL |
+| Local (benchmark) | `./recursive_resolver --local` | Answers from a built-in zone instantly, no network calls — this is what you benchmark against the UDP forwarder |
+
+**What's inside:**
+
+- **DNS name parser** with compression pointer support and loop detection (max 128 pointers)
+- **Iterative resolution**: picks a random root server, follows referrals using glue records from the additional section, follows CNAME chains (up to 8 hops), enforces a depth limit of 16 referral hops
+- **TTL-based cache** (4096 buckets, 8192 entries max) with LRU eviction and negative caching (NXDOMAIN)
+- **Randomized TXIDs** via `getrandom()` — fixes the sequential-TXID weakness in the baseline
+- **Timeout handling**: 5s overall deadline per client query, 2s per hop, retries with alternate nameservers
+- **Anti-spoofing**: validates that responses come from the NS we actually queried
+- **Same epoll loop structure** as the baseline, same port (5353), same NOTIMP for non-A/AAAA — so benchmarks are a fair comparison
+
+**Test results in this session:**
+
+| Test | Result |
+|---|---|
+| `google.com A` (local mode) | ✅ 142.250.80.46 |
+| `example.com A` | ✅ 93.184.216.34 |
+| `nonexistent.test A` | ✅ NXDOMAIN |
+| `google.com TXT` | ✅ NOTIMP |
+| 7 malformed packets | ✅ All dropped |
+| Valid control query | ✅ 54 bytes back |
+| 200 concurrent queries | ✅ 200/200 answered |
+
+**To build and run in WSL:**
+```bash
+# Debug build
+gcc -g -O1 -Wall -Wextra -fsanitize=address,undefined -o recursive_asan recursive_resolver.c
+
+# Optimized build (for benchmarking)
+gcc -O3 -Wall -Wextra -o recursive_resolver recursive_resolver.c
+
+# Run in local mode for benchmarking
+./recursive_resolver --local
+
+# Run in recursive mode (needs internet access)
+./recursive_resolver
+```
+
+The recursive mode will need internet access from WSL to reach root servers. Try it with `dig @127.0.0.1 -p 5353 google.com A` — the first query will take a few hundred ms (walking the hierarchy), and subsequent queries for the same name will be near-instant (cache hit).
+
+What is the fundamental difference between lcoal mode and recursive mode
+
+The fundamental difference is **where the answer comes from** — and that single difference changes what you're actually measuring when you benchmark.
+
+## Local mode
+
+The answer is in **your own process memory**. The resolver has a hardcoded table (`local_zone[]`) of about 8 names mapped to IPs. When a query arrives:
+
+```
+query in → parse → table lookup → build response → send
+```
+
+No network calls. No cache lookups that could miss. No upstream servers. Everything happens inside the resolver's own address space, on the same CPU core, with no I/O waits.
+
+**Typical latency: tens of microseconds.** You're measuring your code — parsing, event loop overhead, syscall cost.
+
+## Recursive mode
+
+The answer comes from **the real DNS hierarchy on the public internet**. When a query arrives:
+
+```
+query in → parse → cache check → (miss) → send query to root server → wait for reply
+                                        → send query to .com TLD server → wait for reply
+                                        → send query to authoritative server → wait for reply
+                                        → cache the answer → build response → send
+```
+
+Each of those "wait for reply" steps is a network round trip over the real internet. The resolver sits idle during each one, waiting for `epoll_wait` to fire.
+
+**Typical latency: 50–500 ms for a cold query, under 1 ms for a cache hit.** You're mostly measuring the internet, not your code.
+
+## Why this matters for your project
+
+The problem statement asks you to compare AF_XDP vs ordinary UDP sockets on **latency, throughput, and CPU overhead**. AF_XDP saves microseconds per packet by skipping kernel socket layers. That saving is only visible if the rest of the pipeline is also measured in microseconds.
+
+- **Benchmark in local mode.** Everything the resolver does is CPU-bound and sub-millisecond. Replacing UDP sockets with AF_XDP will produce a visible, measurable difference.
+- **Functional testing in recursive mode.** This proves your resolver actually works — can walk the hierarchy, follow referrals, handle CNAMEs. But as the README of the baseline already noted, latency to 8.8.8.8 (~17 ms) completely drowns out any socket-layer savings.
+
+Think of it this way: if your car has a faster engine but you're stuck in traffic, the lap time looks the same. Local mode is the empty track where the engine upgrade actually shows up.
+
+## One more subtle difference
+
+In local mode, the `--local` flag also tells the main loop to use `epoll_wait(timeout = -1)` (block forever until a packet arrives) instead of the 100ms poll it uses in recursive mode. Recursive mode needs the poll so it can wake up periodically to check for timed-out upstream queries. Local mode has no upstream queries, so no timeouts to track, so no reason to wake up. That's a small but real efficiency difference — one less thing between a packet arriving and the response going out.
+
+Consider the ChatGPT explanation of the topic as the top layer of abstraction of the concept and the bare code the bottom layer of abstraction, and data structures, tool calls and libraries being somewhere in between, how many layers do you think should we understand as the instructor said from top to bottom before we implement the code? Also one more thing, we gotta include the recursive DNS resolver too as the ChatGPT explanation does not cover that yet. So we haven't covered even the top layer of recursive DNS resolver design.
+
+Good question to pause on, because "how many layers" is really asking "how deep does understanding need to go before code stops being copying." Let me give you a concrete layer model, then fill the gap you identified — the recursive resolver has no top layer yet.
+
+## The layer stack
+
+I'd use **five layers**. Your framing had the two endpoints right; the middle is really three distinct things, not one.
+
+1. **Mental model** — what the thing does and why it exists, in plain language. ("XDP makes an early decision; AF_XDP is a fast lane to userspace." "A recursive resolver answers one question by asking many servers itself.") This is the ChatGPT explanation layer.
+2. **Architecture & data flow** — the components and the journey of one unit of work through them. (The packet's trip FILL → RX → TX → COMPLETION. The query's walk root → TLD → authoritative.) Boxes and arrows, no code.
+3. **State & data structures** — what you must *remember* between steps, and in what shape. (The four rings and UMEM frames. The pending-query table, the cache, the NS list.) This is where a design becomes concrete without being code yet.
+4. **Interfaces** — the syscalls, library calls, and byte layouts you'll actually invoke. (`xsk_socket__create`, `bpf_redirect_map`, the RX descriptor fields. `recvfrom`, `epoll_wait`, the DNS header bit layout.)
+5. **Bare code** — bounds-checked parsing, ring index arithmetic, checksum math, the actual bytes.
+
+**Where to stop before implementing:** understand layers 1–3 fully, and sketch layer 4 (know *which* calls, roughly in what order). Layer 5 is where understanding gets *proven*, not where it starts — that's exactly your instructor's point. By the time you've honestly decomposed something to layer 4, writing layer 5 is mechanical, and if it isn't, that's the signal you skipped something in 2 or 3.
+
+## The important structural point: you have two stacks, not one
+
+The project is two subsystems that each run top-to-bottom independently and only touch at the bottom:
+
+- **Stack A — the resolver** (what answer to produce): layers 1–5 are about DNS semantics.
+- **Stack B — the transport** (how the packet gets in and out): layers 1–5 are about AF_XDP/XDP.
+
+They converge at the contract I mentioned earlier: `receive → parse → answer → send`. AF_XDP only replaces *receive* and *send*. The resolver owns *answer*. Both share *parse*. So you don't walk one five-layer stack — you walk two, and the AF_XDP work (Stack B) swaps out the top and bottom of the pipe while the resolver (Stack A) stays put. That's why building the resolver first on plain sockets was the right call: Stack A is fully testable before Stack B exists.
+
+Your ChatGPT material covers Stack B, layers 1–2, well. Stack A has nothing above layer 5 — except that `recursive_resolver.c` already *is* layer 5. So you have the unusual situation of owning the bottom of a stack with no top written down. Let me give you the top.
+
+## The missing top layer: recursive DNS resolver design
+
+**The mental model (layer 1).** A recursive resolver is the server that does the legwork. A client (your laptop's stub resolver) asks it one question — "A record for www.example.com?" — and expects one final answer. The resolver earns that answer by asking a *chain* of other servers, none of which knows the whole answer, each of which knows only who to ask next. Contrast it with the three things it is *not*: an **authoritative server** (knows one zone cold, e.g. the .com servers), a **forwarder** (just hands your question to another recursive resolver — this is what your teammates' baseline actually is), and a **stub resolver** (the thin client library that asks a recursive resolver and does no walking).
+
+One naming trap worth clearing up now, because it confused the earlier discussion: the service is **recursive** (client asks once, gets the final answer), but the internal method is **iterative** (the resolver itself walks the tree one hop at a time instead of delegating). Your program is "a recursive resolver that resolves iteratively." Both words are correct and they describe different things — the interface vs. the algorithm.
+
+**The walk (layer 2).** The namespace is a tree: root (`.`) → TLD (`.com`) → authoritative (`example.com`). Each level knows only the delegation to the next level down. You bootstrap knowing exactly one thing: the 13 root server IPs, hardcoded (these are the "root hints" — the `ROOT_SERVERS[]` array in your code). The walk for www.example.com:
+
+- Ask a **root** server for www.example.com. It doesn't know, but replies: "I don't have the answer; ask the .com servers — and here are their IPs." That reply is a **referral**.
+- Ask a **.com** server the same question. Another referral: "ask example.com's servers, here are their IPs."
+- Ask an **example.com** server. It's **authoritative** for that zone, so it returns the actual answer with the AA (authoritative answer) bit set.
+
+**The sub-concepts that make the walk real (still layer 2, bleeding into 3):**
+
+- **Referral** = a reply with zero answer records but NS records in the *authority* section pointing one level down.
+- **Glue** = the A records for those NS names, included in the *additional* section. Without glue you'd have a chicken-and-egg problem (to find example.com you must contact ns1.example.com, whose address is... inside example.com). A delegation without glue is **glueless**, and then you must pause the current query and spin up a *sub-query* to resolve the nameserver's own name first. Your code handles the glue case and honestly stubs the glueless case — that's a real gap to discuss, not hide.
+- **CNAME** = an alias. You asked for the A record of a name that turns out to be "really called" something else; you must restart the walk for the target name. (Your `handle_ns_response` CNAME branch.)
+- **Negative answers**: **NXDOMAIN** (the name does not exist anywhere) vs. **NODATA** (the name exists but has no record of the type you asked). These are different and clients care about the difference.
+- **Caching with TTL**: every record carries a time-to-live; you cache answers *and* referrals *and* negatives, keyed by (name, type), and serve from cache until expiry. This is not an optimization bolted on the side — it's what separates a resolver from a thing that hammers the root servers on every query. It's also the single biggest reason the resolver and the forwarder will benchmark completely differently.
+- **Robustness**: multiple nameservers per level (so you retry a different one on timeout), a per-hop timeout, and a depth/loop budget so a malicious or broken delegation can't make you walk forever.
+- **Security**: randomized transaction IDs *and* randomized source ports (defense against the Kaminsky cache-poisoning attack), plus **bailiwick checking** — only accept records a server is actually authorized to give. A .com server must not be allowed to hand you an A record for google.com and have you cache it. Your code randomizes TXIDs and checks the sender IP, but doesn't yet randomize source port (single socket) or do bailiwick checks. Both are worth naming as deliberate, documented gaps.
+
+**Closing the loop for top-down study.** The nice thing is that `recursive_resolver.c` already is the bottom of this stack, so your team can study it the instructor's way — read the concept above, then map each concept to the function that implements it:
+
+| Concept (layer 1–2) | Where it lives (layer 5) |
+|---|---|
+| The walk from root | `start_resolution` → `handle_ns_response` |
+| Referral + glue | the `resp->ns_count > 0` branch, additional-section scan |
+| CNAME restart | the `found_cname` branch |
+| Caching + TTL + negative | `cache_insert` / `cache_lookup` |
+| Timeouts & retry | `check_timeouts`, `try_next_ns` |
+| Security (partial) | `rand_txid`, the sender-IP check |
+
+The gaps (glueless delegation, source-port randomization, bailiwick checking, NODATA vs NXDOMAIN) are the honest edges — exactly the kind of thing an instructor doing top-down wants you to *name* rather than paper over.
+
+So: **five layers, walked twice** (resolver and transport), converging at the receive/parse/answer/send contract. Understand down through layer 3 completely and layer 4 in outline before writing; let layer 5 be where you prove you understood.
+
+If it'd help the team, I can turn this into a single layered study map — both stacks side by side, each layer with "what you must be able to explain before moving down" — as a doc you can share. Want that?
+
+So you're telling me we have covered how many layers in the ChatGPT explanation?
+
+Honestly, about **two and a half** — and only of the transport stack (Stack B). Here's the breakdown so the number isn't just a vibe:
+
+- **Layer 1 (mental model): fully covered.** "XDP decides, AF_XDP is the fast lane, UMEM holds the bytes, the resolver does the logic" — the sorting-and-delivery analogy nails it.
+- **Layer 2 (architecture & data flow): fully covered.** The 4-query / 3-frame walkthrough traces one packet ring by ring, FILL → RX → TX → COMPLETION, including what happens when you run out of frames. That *is* the data-flow layer done well.
+- **Layer 3 (state & data structures): about half.** It tells you *what* state exists and why — four rings, their directions, UMEM frames, the XSKMAP — which is the top of layer 3. It never reaches the concrete shape: descriptor fields, ring sizes, frame addressing math. So you know the pieces, not their layout.
+- **Layer 4 (interfaces): gestured at, not covered.** It shows `bpf_redirect_map` and `xsk_umem__create`-style calls, but every block is explicitly labeled "conceptual, not compilable, helper args omitted." Naming a function in pseudocode isn't the same as understanding its real signature, its error cases, and the ordering constraints around it.
+- **Layer 5: zero**, by its own admission.
+
+And the part that matters most for your plan: **ChatGPT covered zero layers of Stack A, the resolver** — until the conceptual write-up I just gave you. So before today you had the transport explained down to ~2.5 layers and the resolver explained at layer 5 only (the code, bottom-up, no top).
+
+So the real state of the project, by layer:
+
+| | Stack A (resolver) | Stack B (AF_XDP transport) |
+|---|---|---|
+| L1 mental model | ✅ (today) | ✅ |
+| L2 data flow | ✅ (today) | ✅ |
+| L3 state/structures | ✅ (code exists) | ◐ half |
+| L4 interfaces | ✅ (code exists) | ❌ |
+| L5 bare code | ✅ `recursive_resolver.c` | ❌ |
+
+The asymmetry is the takeaway: the resolver is now understood top-to-bottom *and* built. The transport is understood top-down only to layer 2-and-a-half, and nothing below exists yet. That layer-3-bottom through layer-5 gap on Stack B is precisely the work the AF_XDP phase has to fill — and it's the part ChatGPT's pseudocode makes *look* covered when it isn't.
+
+Now we're at Layer 4: actual AF_XDP initialization and runtime mechanics.
+
+This is where all the previous concepts become concrete Linux system calls and libbpf APIs.
+
+I want to explain this in execution order, because there are a few subtle distinctions in your notes that matter when you start writing C code.
+
+First, understand the overall lifecycle:
+
+Allocate memory in userspace.
+
+Register that memory with the kernel as UMEM.
+
+Create and bind an AF_XDP socket.
+
+Load and attach the XDP program.
+
+Connect the socket to the XDP program through XSKMAP.
+
+Run the event loop to receive, process, transmit, and recycle packets.
+
+There are also three corrections worth keeping in mind:
+
+MAP_HUGETLB is an optional performance optimization, not an AF_XDP requirement.
+
+UMEM registration and AF_XDP socket creation are related, but they are distinct operations.
+
+XDP_USE_NEED_WAKEUP changes how you determine when to kick the kernel; it does not automatically mean poll() handles every TX notification.
+
+Let's go phase by phase.
+
+Phase 1 — Allocate UMEM memory
+Your code:
+
+mmap(NULL, umem_size,
+     PROT_READ | PROT_WRITE,
+     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+     -1, 0);
+1.1 What is mmap() doing?
+mmap() requests a memory mapping from the operating system.
+
+The arguments:
+
+Argument
+
+Meaning
+
+NULL
+
+Let the OS choose the virtual address
+
+umem_size
+
+Number of bytes requested
+
+PROT_READ \| PROT_WRITE
+
+Allow reading and writing
+
+MAP_PRIVATE
+
+Private mapping
+
+MAP_ANONYMOUS
+
+Not backed by a regular file
+
+MAP_HUGETLB
+
+Request huge pages
+
+-1
+
+No file descriptor
+
+0
+
+File offset
+
+Suppose:
+
+#define FRAME_SIZE 2048
+#define NUM_FRAMES 4096
+
+size_t umem_size = FRAME_SIZE * NUM_FRAMES;
+Then:
+
+\[ 2048 \times 4096 = 8,388,608\text{ bytes} \]
+That's 8 MiB.
+
+The returned pointer is your UMEM base:
+
+void *umem_area = mmap(...);
+You will use it throughout the application:
+
+uint8_t *packet =
+    xsk_umem__get_data(umem_area, desc->addr);
+1.2 Why huge pages?
+Normally, memory is managed in pages, commonly 4 KiB on x86-64 Linux.
+
+With 8 MiB of memory:
+
+\[ \frac{8\text{ MiB}}{4\text{ KiB}}=2048\text{ pages} \]
+With 2 MiB huge pages:
+
+\[ \frac{8\text{ MiB}}{2\text{ MiB}}=4\text{ pages} \]
+Normal pages
+
+4K
+
+4K
+
+4K
+
+4K
+
+4K
+
+4K
+
+4K
+
+4K
+
+Illustrative: 8 pages represent 32 KiB.
+
+Huge pages
+
+2 MiB
+
+2 MiB
+
+For the same 4 MiB of memory, only two huge pages are required.
+
+Why does this help?
+
+The CPU's Translation Lookaside Buffer (TLB) caches virtual-to-physical address translations.
+
+If packet processing frequently accesses many different memory locations, fewer page translations can reduce TLB pressure.
+
+Huge pages can therefore improve memory-access efficiency.
+
+But there are two important distinctions:
+
+Huge pages don't directly make the NIC's DMA engine faster.
+
+Huge pages aren't required for AF_XDP zero-copy.
+
+Zero-copy depends primarily on the NIC driver, hardware support, DMA mappings, and AF_XDP configuration.
+
+Also, huge pages can be harder to allocate because they require appropriately available huge-page memory.
+
+1.3 What if MAP_HUGETLB fails?
+Your fallback idea is correct.
+
+void *umem_area = mmap(
+    NULL,
+    umem_size,
+    PROT_READ | PROT_WRITE,
+    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+    -1,
+    0
+);
+
+if (umem_area == MAP_FAILED) {
+    umem_area = mmap(
+        NULL,
+        umem_size,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0
+    );
+}
+
+if (umem_area == MAP_FAILED) {
+    perror("mmap");
+    exit(EXIT_FAILURE);
+}
+For production code, also verify the mapping's alignment and the memory-registration requirements of your selected AF_XDP configuration.
+
+Phase 2 — Register UMEM with the kernel
+Now we have:
+
+void *umem_area;
+size_t umem_size;
+But currently, this is just a userspace memory allocation.
+
+The kernel doesn't yet know that this memory is intended for AF_XDP packet buffers.
+
+We need to register it.
+
+2.1 What does registration accomplish?
+We tell the kernel:
+
+Here is a memory region.
+
+Base address: umem_area
+Size:         8 MiB
+Chunk size:   2048 bytes
+Headroom:     configured number of bytes
+
+Please register this as UMEM for AF_XDP.
+The kernel establishes the necessary memory-management and DMA-related arrangements for the selected driver and operating mode.
+
+This is not simply passing a pointer to the kernel and hoping it can access it.
+
+The kernel validates the registration, establishes the required mappings and tracks the region for AF_XDP.
+
+2.2 The libbpf call
+struct xsk_umem *umem;
+
+struct xsk_ring_prod fill_ring;
+struct xsk_ring_cons comp_ring;
+
+struct xsk_umem_config cfg = {
+    .fill_size = 2048,
+    .comp_size = 2048,
+    .frame_size = 2048,
+    .frame_headroom = 0,
+    .flags = 0
+};
+
+int ret = xsk_umem__create(
+    &umem,
+    umem_area,
+    umem_size,
+    &fill_ring,
+    &comp_ring,
+    &cfg
+);
+Let's understand the objects:
+
+Object
+
+What it represents
+
+umem
+
+libbpf's handle for the registered UMEM
+
+umem_area
+
+Actual userspace memory region
+
+fill_ring
+
+Userspace-to-kernel receive-buffer supply ring
+
+comp_ring
+
+Kernel-to-userspace TX completion ring
+
+cfg
+
+UMEM and ring configuration
+
+A very important detail: the FILL and COMPLETION rings belong to the UMEM arrangement, not independently to every socket.
+
+If you have multiple sockets sharing a UMEM, they share these two rings, while each socket has its own RX and TX rings.
+
+The Linux Kernel documentation+1
+2.3 What happens internally?
+Conceptually, the kernel API operations include:
+
+socket(AF_XDP, SOCK_RAW, 0);
+This creates an AF_XDP socket used to establish the UMEM.
+
+Then:
+
+setsockopt(
+    fd,
+    SOL_XDP,
+    XDP_UMEM_REG,
+    &reg,
+    sizeof(reg)
+);
+The registration structure conceptually contains:
+
+struct xdp_umem_reg {
+    __u64 addr;
+    __u64 len;
+    __u32 chunk_size;
+    __u32 headroom;
+    __u32 flags;
+};
+It tells the kernel:
+
+Where the UMEM starts.
+
+How large it is.
+
+How it is divided into chunks.
+
+How much headroom is reserved.
+
+Which registration options are enabled.
+
+Next, configure the two UMEM rings:
+
+setsockopt(fd, SOL_XDP, XDP_UMEM_FILL_RING,
+           &ring_size, sizeof(ring_size));
+
+setsockopt(fd, SOL_XDP, XDP_UMEM_COMPLETION_RING,
+           &ring_size, sizeof(ring_size));
+The kernel allocates/configures the ring structures and makes them accessible to userspace through memory mapping.
+
+The application then maps the rings using the offsets obtained through XDP_MMAP_OFFSETS.
+
+What does XDP_MMAP_OFFSETS do?
+The kernel tells userspace where the ring structures reside in the AF_XDP socket's mmap interface.
+
+For example, it provides offsets for:
+
+FILL ring mapping
+COMPLETION ring mapping
+RX ring mapping
+TX ring mapping
+The ring's producer/consumer indices and descriptor/address arrays become accessible through these mappings.
+
+The important point is that you do not allocate the actual AF_XDP ring arrays using malloc() and then tell the kernel to use them. The kernel provides the ring interface, which userspace maps.
+
+libbpf hides most of these system calls.
+
+2.4 A subtle distinction: UMEM socket versus packet socket
+Your notes describe two socket creations:
+
+First socket:
+    UMEM registration and FILL/COMPLETION setup
+
+Second socket:
+    Actual XSK with RX/TX rings
+This is a useful conceptual distinction, but don't interpret it as a requirement to have two independent sockets for every AF_XDP application.
+
+libbpf's xsk_umem__create() manages the underlying AF_XDP UMEM socket, and xsk_socket__create() creates an XSK associated with that UMEM.
+
+When multiple XSKs share a UMEM, the subsequent sockets use the shared-UMEM mechanism.
+
+For a single-socket application, libbpf manages the association for you. For multiple sockets, the sharing configuration becomes important.
+
+Phase 3 — Create and bind the AF_XDP socket
+Now we have registered UMEM.
+
+But we still need a socket associated with a specific network device and receive queue.
+
+For example:
+
+Interface: eth0
+Queue ID:  0
+The socket is the userspace endpoint for packet reception and transmission.
+
+3.1 Create it with libbpf
+struct xsk_socket *xsk;
+
+struct xsk_ring_cons rx_ring;
+struct xsk_ring_prod tx_ring;
+
+struct xsk_socket_config xsk_cfg = {
+    .rx_size = 2048,
+    .tx_size = 2048,
+    .libbpf_flags = 0,
+    .xdp_flags = XDP_FLAGS_DRV_MODE,
+    .bind_flags = XDP_COPY
+};
+
+int ret = xsk_socket__create(
+    &xsk,
+    "eth0",
+    0,
+    umem,
+    &rx_ring,
+    &tx_ring,
+    &xsk_cfg
+);
+Notice that this call receives the existing UMEM handle.
+
+It creates the socket and configures its RX and TX rings.
+
+3.2 What happens internally?
+Conceptually:
+
+int xsk_fd = socket(AF_XDP, SOCK_RAW, 0);
+Then:
+
+setsockopt(xsk_fd, SOL_XDP, XDP_RX_RING,
+           &rx_size, sizeof(rx_size));
+
+setsockopt(xsk_fd, SOL_XDP, XDP_TX_RING,
+           &tx_size, sizeof(tx_size));
+The kernel configures the RX and TX rings.
+
+Userspace maps them using the mmap offsets.
+
+Finally, we bind the socket.
+
+3.3 Understanding struct sockaddr_xdp
+This is the structure that tells the kernel where the socket belongs.
+
+Conceptually:
+
+struct sockaddr_xdp {
+    sa_family_t sxdp_family;
+    __u16       sxdp_flags;
+    __u32       sxdp_ifindex;
+    __u32       sxdp_queue_id;
+    __u32       sxdp_shared_umem_fd;
+};
+Let's break it down.
+
+Field
+
+Meaning
+
+sxdp_family
+
+AF_XDP
+
+sxdp_flags
+
+Bind configuration flags
+
+sxdp_ifindex
+
+Network interface index
+
+sxdp_queue_id
+
+NIC receive queue
+
+sxdp_shared_umem_fd
+
+FD identifying the UMEM-sharing socket when applicable
+
+For example:
+
+struct sockaddr_xdp sxdp = {
+    .sxdp_family = AF_XDP,
+    .sxdp_ifindex = if_nametoindex("eth0"),
+    .sxdp_queue_id = 0,
+    .sxdp_flags = XDP_COPY
+};
+
+bind(xsk_fd, (struct sockaddr *)&sxdp, sizeof(sxdp));
+The interface index identifies eth0; the queue ID identifies queue 0.
+
+After a successful bind, the socket is associated with that interface/queue combination.
+
+3.4 The two important bind flags
+This is one of the hard points you identified.
+
+XDP_COPY
+Copy mode
+
+The kernel/driver copies packet data into UMEM as necessary.
+
+Does not require zero-copy-capable driver support.
+
+Has packet-copy overhead.
+
+Useful for compatibility and initial development.
+
+XDP_ZEROCOPY
+Zero-copy mode
+
+The driver/NIC receives packets into UMEM-backed buffers using the supported zero-copy path.
+
+Avoids the additional packet-data copy into UMEM.
+
+Requires appropriate driver and device support.
+
+Can fail if zero-copy is unavailable.
+
+There is also a subtle default behavior:
+
+If you explicitly request XDP_COPY, the socket uses copy mode.
+
+If you explicitly request XDP_ZEROCOPY, the bind fails if zero-copy cannot be supported.
+
+If neither is explicitly forced, the kernel can attempt zero-copy and fall back to copy mode.
+
+The Linux Kernel documentation+1
+Does the UMEM address change when falling back?
+No.
+
+Suppose the RX descriptor says:
+
+addr = 2048;
+len = 71;
+Your application still accesses:
+
+uint8_t *packet =
+    xsk_umem__get_data(umem_area, 2048);
+The descriptor's UMEM-relative address remains the addressing mechanism in both modes.
+
+What changes is how packet bytes reach that UMEM buffer.
+
+COPY MODE:
+
+NIC
+ |
+ v
+Kernel/driver packet buffer
+ |
+ | Copy
+ v
+UMEM Frame
+ |
+ v
+Userspace
+
+
+ZERO-COPY MODE:
+
+NIC DMA
+ |
+ v
+UMEM-backed receive buffer
+ |
+ v
+Userspace
+This is a critical distinction: zero-copy changes the data-transfer mechanism, not the application's descriptor format.
+
+You can also inspect whether the socket actually obtained zero-copy mode using XDP_OPTIONS and XDP_OPTIONS_ZEROCOPY, rather than assuming that your requested configuration succeeded.
+
+One practical recommendation: begin with XDP_COPY while developing. Once your packet parsing and buffer lifecycle are correct, test zero-copy on supported physical hardware.
+
+Phase 4 — Load the XDP program and populate XSKMAP
+Now we have:
+
+UMEM registered.
+
+AF_XDP socket created.
+
+RX/TX rings configured.
+
+Socket bound to eth0, queue 0.
+
+But packets still need to be redirected to this socket.
+
+That's the job of the XDP program and XSKMAP.
+
+4.1 Open the compiled eBPF object
+You write your kernel-side program in C:
+
+SEC("xdp")
+int xdp_sock_prog(struct xdp_md *ctx)
+{
+    // Classify packet.
+
+    return bpf_redirect_map(
+        &xsks_map,
+        ctx->rx_queue_index,
+        XDP_PASS
+    );
+}
+Compile it into an eBPF object:
+
+clang -O2 -g -target bpf \
+    -c xdp_kern.c \
+    -o xdp_kern.o
+This is not an ordinary userspace executable.
+
+It is an eBPF object that the kernel will load and verify.
+
+4.2 Load the object
+struct bpf_object *obj =
+    bpf_object__open_file("xdp_kern.o", NULL);
+
+if (libbpf_get_error(obj))
+    exit(EXIT_FAILURE);
+
+int err = bpf_object__load(obj);
+
+if (err)
+    exit(EXIT_FAILURE);
+What does bpf_object__load() do?
+
+Conceptually:
+
+Loads the eBPF program into the kernel.
+
+Creates the BPF maps declared in the object.
+
+Runs the eBPF verifier.
+
+Makes the loaded program and maps accessible through file descriptors.
+
+The verifier checks things such as:
+
+Memory safety.
+
+Packet boundary checks.
+
+Permitted helper usage.
+
+Valid control flow.
+
+Program-specific constraints.
+
+4.3 Obtain the program and map
+struct bpf_program *prog =
+    bpf_object__find_program_by_name(
+        obj, "xdp_sock_prog"
+    );
+
+int map_fd =
+    bpf_object__find_map_fd_by_name(
+        obj, "xsks_map"
+    );
+You now have:
+
+prog
+    Handle for the loaded XDP program.
+
+map_fd
+    File descriptor for XSKMAP.
+4.4 Attach the XDP program
+int prog_fd = bpf_program__fd(prog);
+
+bpf_xdp_attach(
+    ifindex,
+    prog_fd,
+    XDP_FLAGS_DRV_MODE,
+    NULL
+);
+A correction to the naming in your notes: the relevant libbpf flag is XDP_FLAGS_DRV_MODE, not BPF_FLAGS_DRV_MODE.
+
+The two important attachment modes are:
+
+Flag
+
+Meaning
+
+XDP_FLAGS_DRV_MODE
+
+Native/driver XDP
+
+XDP_FLAGS_SKB_MODE
+
+Generic XDP
+
+Native XDP executes in the driver receive path and is generally preferred for performance.
+
+Generic XDP operates later in the networking path and is useful for compatibility, but has different performance characteristics.
+
+Don't assume WSL2 or loopback will support every AF_XDP mode. Support depends on the actual network device, driver, and environment.
+
+4.5 Populate XSKMAP
+Now connect the XDP program to your AF_XDP socket.
+
+int xsk_fd = xsk_socket__fd(xsk);
+
+__u32 key = 0;
+
+bpf_map_update_elem(
+    map_fd,
+    &key,
+    &xsk_fd,
+    BPF_ANY
+);
+The resulting mapping:
+
+XSKMAP
+
+0  ------>  XSK socket bound to eth0, queue 0
+The XDP program executes:
+
+bpf_redirect_map(
+    &xsks_map,
+    ctx->rx_queue_index,
+    XDP_PASS
+);
+For queue 0:
+
+ctx->rx_queue_index = 0
+
+XSKMAP[0] = xsk_fd
+
+Redirect to XSK
+Important initialization detail: configure the socket and populate XSKMAP before enabling traffic through the attached XDP program, or otherwise ensure that packets cannot hit an unpopulated map entry. This avoids packets being dropped during startup.
+
+Your actual initialization can therefore be organized as:
+
+1. Allocate UMEM
+2. Register UMEM
+3. Create and bind XSK
+4. Load XDP program and map
+5. Populate XSKMAP
+6. Attach XDP program
+7. Populate FILL ring
+8. Start event loop
+The exact ordering can be adjusted for the setup, but the map must be ready when redirection begins.
+
+Phase 5 — The event loop
+This is the most important part of the runtime implementation.
+
+Everything before this was initialization.
+
+Now packets are continuously arriving, being processed, and being transmitted.
+
+Let's understand each sub-step.
+
+5A. Wait for packets — poll()
+Your code:
+
+struct pollfd pfd = {
+    .fd = xsk_fd,
+    .events = POLLIN
+};
+
+poll(&pfd, 1, timeout_ms);
+What is happening?
+
+The application tells the kernel:
+
+I am interested in events on this AF_XDP socket. Wake me when relevant activity occurs or the timeout expires.
+
+POLLIN is used for receive readiness.
+
+The important distinction:
+
+poll() does not itself retrieve packet data.
+
+It waits for readiness.
+
+You still need to consume RX descriptors using the ring API.
+
+Conceptually:
+
+Userspace worker
+       |
+       v
+poll(xsk_fd)
+       |
+       | Wait
+       |
+       v
+Kernel reports RX readiness
+       |
+       v
+Userspace consumes RX ring
+You can also implement busy polling, where the application repeatedly checks ring availability instead of sleeping. This can reduce latency at the cost of CPU usage.
+
+5B. Drain the RX ring
+Your code:
+
+size_t rcvd = xsk_ring_cons__peek(
+    &rx_ring,
+    BATCH_SIZE,
+    &idx
+);
+Let's understand the arguments.
+
+Argument
+
+Meaning
+
+&rx_ring
+
+The RX consumer ring
+
+BATCH_SIZE
+
+Maximum descriptors to retrieve
+
+&idx
+
+Starting index of the available descriptor batch
+
+Suppose:
+
+BATCH_SIZE = 64
+
+Available RX descriptors = 3
+Then:
+
+rcvd = 3;
+You now have three descriptors available to consume.
+
+Retrieve each descriptor:
+
+const struct xdp_desc *desc =
+    xsk_ring_cons__rx_desc(&rx_ring, idx++);
+For each descriptor:
+
+uint8_t *pkt =
+    xsk_umem__get_data(
+        umem_area,
+        desc->addr
+    );
+Suppose:
+
+desc->addr = 2048
+desc->len  = 71
+Then pkt points to the first byte of the Ethernet frame.
+
+You can parse it:
+
+struct ethhdr *eth =
+    (struct ethhdr *)pkt;
+Then locate IPv4, UDP, and DNS using validated offsets.
+
+Why do we call release()?
+After reading the RX descriptors:
+
+xsk_ring_cons__release(&rx_ring, rcvd);
+This advances the RX consumer index.
+
+It tells the kernel:
+
+I have consumed these RX ring entries. You may reuse their ring slots.
+
+But here's a crucial distinction:
+
+Releasing an RX descriptor does not automatically make its UMEM frame available for receiving again.
+
+You must separately manage the buffer's ownership.
+
+For example:
+
+RX descriptor consumed
+        |
+        v
+Application owns packet buffer
+        |
+        v
+Application finishes reading it
+        |
+        v
+Buffer returned to free-frame pool
+        |
+        v
+Buffer eventually submitted to FILL
+Do not confuse ring-slot reclamation with UMEM-frame reclamation.
+
+5C. Submit a response to TX
+Suppose the DNS resolver has built a response in UMEM Frame B.
+
+You need to submit a TX descriptor.
+
+First reserve a slot:
+
+uint32_t tx_idx;
+
+int reserved = xsk_ring_prod__reserve(
+    &tx_ring,
+    1,
+    &tx_idx
+);
+Check that reservation succeeded:
+
+if (reserved != 1) {
+    // TX ring is full or has no available slot.
+    // Keep the frame and retry later.
+}
+Then get the descriptor:
+
+struct xdp_desc *tx_desc =
+    xsk_ring_prod__tx_desc(
+        &tx_ring,
+        tx_idx
+    );
+Populate it:
+
+tx_desc->addr = response_frame_addr;
+tx_desc->len = response_len;
+tx_desc->options = 0;
+Finally:
+
+xsk_ring_prod__submit(&tx_ring, 1);
+What happened?
+
+UMEM Frame B
+      |
+      v
+Response bytes already written
+      |
+      v
+TX descriptor constructed
+      |
+      v
+TX ring slot populated
+      |
+      v
+Producer index advanced
+      |
+      v
+Kernel/driver can consume TX work
+Notice that submitting a descriptor does not mean that the packet has already been transmitted.
+
+It only makes the TX work available to the kernel/driver.
+
+That brings us to the second hard point.
+
+Phase 5D — The TX kick: why sendto() is needed
+Your code:
+
+sendto(
+    xsk_fd,
+    NULL,
+    0,
+    MSG_DONTWAIT,
+    NULL,
+    0
+);
+At first this looks strange.
+
+Why call sendto() with:
+
+No payload.
+
+Zero bytes.
+
+No destination address.
+
+Isn't the packet already in the TX ring?
+
+Yes. The packet is already in UMEM, and its descriptor is already in the TX ring.
+
+The purpose of this call is to notify the kernel that it should process pending TX descriptors.
+
+Think about the distinction:
+
+xsk_ring_prod__submit()
+    |
+    v
+Publishes TX descriptor
+    |
+    v
+Kernel/driver knows work is available
+    |
+    v
+But may need an explicit wakeup
+    |
+    v
+sendto() kick
+    |
+    v
+Driver processes pending TX work
+The sendto() call is a notification mechanism here. It is not sending the actual DNS packet payload through the ordinary socket-send interface.
+
+The kernel obtains the packet bytes from the TX descriptor and the associated UMEM buffer.
+
+Why do we need XDP_USE_NEED_WAKEUP?
+Without this mechanism, the application might perform unnecessary system calls even when the driver is already processing TX work.
+
+XDP_USE_NEED_WAKEUP introduces a flag that indicates whether an explicit wakeup is currently required.
+
+It is available on the producer-side rings:
+
+FILL ring.
+
+TX ring.
+
+For TX, the application checks:
+
+if (xsk_ring_prod__needs_wakeup(&tx_ring)) {
+
+    sendto(
+        xsk_fd,
+        NULL,
+        0,
+        MSG_DONTWAIT,
+        NULL,
+        0
+    );
+}
+The logic:
+
+Submit TX descriptors
+        |
+        v
+Check NEED_WAKEUP
+        |
+        +---- 0 ----> No explicit kick needed
+        |
+        +---- 1 ----> Kernel/driver needs notification
+                         |
+                         v
+                       sendto()
+Why is this better?
+
+Imagine processing 100,000 packets.
+
+Without conditional wakeups, you might make a system call for every batch even when the driver is already running.
+
+With XDP_USE_NEED_WAKEUP, you issue a system call only when the kernel indicates that it needs one.
+
+This can reduce system-call overhead and improve performance.
+
+What about poll()?
+The kernel documentation also allows using poll() to wake the driver in the relevant AF_XDP wakeup scenarios.
+
+However, understand that poll() has two roles depending on the situation:
+
+Waiting for socket readiness.
+
+Participating in the explicit wakeup mechanism when required.
+
+It is not correct to assume that simply calling poll() unconditionally means all submitted TX descriptors are automatically kicked.
+
+For a straightforward implementation, use the documented sendto() pattern with xsk_ring_prod__needs_wakeup().
+
+For the FILL ring, there is a similar consideration: when the kernel needs to be woken to replenish hardware receive buffers, userspace can submit buffers and call poll() as required.
+
+The kernel documentation explicitly recommends enabling XDP_USE_NEED_WAKEUP for many applications because it can reduce unnecessary system calls.
+
+The Linux Kernel documentation+1
+Phase 5E — Reclaim TX completions and refill FILL
+This final step closes the memory-ownership cycle.
+
+Suppose you transmitted a response using Frame B.
+
+You cannot immediately reuse Frame B after submitting its TX descriptor.
+
+Why?
+
+Because the driver might still be using its contents.
+
+Imagine:
+
+Userspace writes DNS response into Frame B
+            |
+            v
+Submits Frame B to TX ring
+            |
+            v
+Driver starts transmission
+            |
+            v
+NIC is still accessing Frame B
+If userspace overwrites Frame B at this point, it could corrupt the outgoing packet.
+
+Therefore, you wait for the COMPLETION ring.
+
+5E.1 Consume the COMPLETION ring
+uint32_t comp_idx;
+
+size_t completed = xsk_ring_cons__peek(
+    &comp_ring,
+    BATCH_SIZE,
+    &comp_idx
+);
+Suppose the completion ring contains:
+
+4096
+6144
+These are UMEM offsets.
+
+Read them:
+
+for (int i = 0; i < completed; i++) {
+
+    uint64_t addr =
+        *xsk_ring_cons__comp_addr(
+            &comp_ring,
+            comp_idx++
+        );
+
+    add_to_free_frame_pool(addr);
+}
+Then release the completion entries:
+
+xsk_ring_cons__release(
+    &comp_ring,
+    completed
+);
+Now the application can reuse those frames.
+
+Remember: completion means the kernel has finished processing the TX buffer and returned its ownership. It does not guarantee successful delivery to the remote client.
+
+5E.2 Refill the FILL ring
+Suppose the application has free frames:
+
+Free-frame pool:
+
+Frame B = 2048
+Frame C = 4096
+Frame D = 6144
+We need to make these buffers available to the receive path.
+
+Reserve slots:
+
+uint32_t fill_idx;
+
+size_t reserved = xsk_ring_prod__reserve(
+    &fill_ring,
+    3,
+    &fill_idx
+);
+Populate the ring:
+
+for (int i = 0; i < reserved; i++) {
+
+    *xsk_ring_prod__fill_addr(
+        &fill_ring,
+        fill_idx++
+    ) = get_free_frame();
+}
+Publish:
+
+xsk_ring_prod__submit(
+    &fill_ring,
+    reserved
+);
+The kernel/driver can now use these buffers for future incoming packets.
+
+One correction to your original pseudocode
+You used:
+
+reserved = xsk_ring_prod__reserve(
+    &fill_ring,
+    completed,
+    &fill_idx
+);
+This is fine as a simplified illustration, but you should not assume that the number of TX completions always equals the number of buffers that need to be replenished in FILL.
+
+Why?
+
+Because FILL also needs frames that were previously consumed from RX and are now free.
+
+Your application needs a separate free-frame pool that tracks:
+
+Frames initially available.
+
+Frames returned from RX processing.
+
+Frames returned through TX completions.
+
+Frames currently owned by the kernel/driver.
+
+Frames currently being processed by userspace.
+
+This is a very important part of a correct implementation.
+
+6. The complete runtime loop — putting everything together
+Now let's combine the five sub-steps into one event loop.
+
+There is one important improvement over your original pseudocode: we need to manage a free-frame pool explicitly.
+
+Otherwise, we risk:
+
+Reusing a buffer still owned by the NIC.
+
+Reusing a buffer still being transmitted.
+
+Running out of receive buffers.
+
+Losing track of frames after TX completion.
+
+6.1 Frame ownership states
+A frame should be in exactly one of these states:
+
+State
+
+Meaning
+
+FREE
+
+Available to userspace
+
+FILL
+
+Submitted for receiving
+
+RX
+
+Received and available to userspace
+
+PROCESSING
+
+Resolver is reading/processing it
+
+TX
+
+Submitted for transmission
+
+COMPLETED
+
+Returned by the completion ring
+
+These are conceptual application-level states. FILL and RX describe ownership transitions rather than additional physical memory allocations.
+
+6.2 Complete pseudocode
+while (running) {
+
+    // --------------------------------
+    // 1. Wait for socket activity
+    // --------------------------------
+
+    poll(&pfd, 1, timeout_ms);
+
+
+    // --------------------------------
+    // 2. Consume RX descriptors
+    // --------------------------------
+
+    uint32_t rx_idx;
+
+    uint32_t rcvd = xsk_ring_cons__peek(
+        &rx_ring,
+        BATCH_SIZE,
+        &rx_idx
+    );
+
+    for (int i = 0; i < rcvd; i++) {
+
+        const struct xdp_desc *desc =
+            xsk_ring_cons__rx_desc(
+                &rx_ring,
+                rx_idx + i
+            );
+
+        uint8_t *packet =
+            xsk_umem__get_data(
+                umem_area,
+                desc->addr
+            );
+
+        size_t packet_len = desc->len;
+
+        // Parse Ethernet, IP and UDP.
+        // Validate DNS message.
+        // Resolve DNS query.
+        // Build response.
+
+        // Allocate a DIFFERENT free frame for TX.
+        // Construct Ethernet + IP + UDP + DNS response.
+        // Submit TX descriptor if available.
+
+        // Return the RX frame to the free-frame pool
+        // after finishing with its packet bytes.
+    }
+
+    xsk_ring_cons__release(&rx_ring, rcvd);
+
+
+    // --------------------------------
+    // 3. Kick TX if required
+    // --------------------------------
+
+    if (xsk_ring_prod__needs_wakeup(&tx_ring)) {
+
+        sendto(
+            xsk_fd,
+            NULL,
+            0,
+            MSG_DONTWAIT,
+            NULL,
+            0
+        );
+    }
+
+
+    // --------------------------------
+    // 4. Reclaim TX completions
+    // --------------------------------
+
+    uint32_t comp_idx;
+
+    uint32_t completed =
+        xsk_ring_cons__peek(
+            &comp_ring,
+            BATCH_SIZE,
+            &comp_idx
+        );
+
+    for (int i = 0; i < completed; i++) {
+
+        uint64_t addr =
+            *xsk_ring_cons__comp_addr(
+                &comp_ring,
+                comp_idx + i
+            );
+
+        add_to_free_frame_pool(addr);
+    }
+
+    xsk_ring_cons__release(
+        &comp_ring,
+        completed
+    );
+
+
+    // --------------------------------
+    // 5. Refill FILL ring
+    // --------------------------------
+
+    uint32_t fill_idx;
+
+    uint32_t count = min(
+        free_frame_count,
+        BATCH_SIZE
+    );
+
+    uint32_t reserved =
+        xsk_ring_prod__reserve(
+            &fill_ring,
+            count,
+            &fill_idx
+        );
+
+    for (int i = 0; i < reserved; i++) {
+
+        uint64_t addr = get_free_frame();
+
+        *xsk_ring_prod__fill_addr(
+            &fill_ring,
+            fill_idx + i
+        ) = addr;
+    }
+
+    xsk_ring_prod__submit(
+        &fill_ring,
+        reserved
+    );
+
+    // If FILL needs a wakeup, notify the receive path
+    // using the appropriate poll/wakeup mechanism.
+}
+This is architectural pseudocode rather than a complete compilable program. A real implementation must also handle TX-ring reservation failures, partial batches, malformed packets, shutdown, errors, and synchronization.
+
+7. API symmetry — know exactly which API manages which object
+Your table is good. I'd refine it slightly:
+
+Phase
+
+Main API
+
+Object managed
+
+Allocate UMEM
+
+mmap()
+
+Userspace memory
+
+Register UMEM
+
+xsk_umem__create()
+
+UMEM + FILL + COMPLETION
+
+Create XSK
+
+xsk_socket__create()
+
+XSK + RX + TX + bind
+
+Load BPF
+
+bpf_object__load()
+
+Kernel BPF programs and maps
+
+Attach XDP
+
+bpf_xdp_attach()
+
+Network interface
+
+Populate XSKMAP
+
+bpf_map_update_elem()
+
+Queue-to-socket association
+
+Wait
+
+poll()
+
+Socket readiness
+
+Receive
+
+xsk_ring_cons__peek()
+
+RX descriptors
+
+Transmit
+
+xsk_ring_prod__submit()
+
+TX descriptors
+
+Reclaim
+
+xsk_ring_cons__peek()
+
+Completion addresses
+
+Replenish
+
+xsk_ring_prod__submit()
+
+FILL addresses
+
+A useful architectural observation:
+
+UMEM has one FILL ring and one COMPLETION ring per UMEM, while each AF_XDP socket has its own RX and TX rings.
+
+This becomes particularly important if you later implement multiple worker threads or multiple receive queues.
+
+The Linux Kernel documentation+1
+8. The two hard questions — revision
+Let's make sure the two concepts you specifically wanted to drill down on are clear.
+
+Question 1: What happens when zero-copy isn't supported?
+Suppose:
+
+sxdp_flags = XDP_ZEROCOPY;
+The driver doesn't support zero-copy.
+
+Result: bind fails.
+
+If instead:
+
+sxdp_flags = XDP_COPY;
+The kernel uses copy mode.
+
+If neither mode is forced, the kernel can attempt zero-copy and fall back to copy mode.
+
+Does the descriptor change?
+
+No.
+
+struct xdp_desc {
+    __u64 addr;
+    __u32 len;
+    __u32 options;
+};
+The same descriptor format is used. Only the way packet bytes reach UMEM changes.
+
+Question 2: Why does sendto() trigger transmission?
+Because submitting a TX descriptor and notifying the driver are separate operations.
+
+TX ring submit
+      |
+      v
+Descriptor is available
+      |
+      v
+Driver may need explicit notification
+      |
+      v
+sendto(NULL, 0)
+      |
+      v
+Driver processes TX descriptors
+With XDP_USE_NEED_WAKEUP:
+
+if (xsk_ring_prod__needs_wakeup(&tx_ring))
+    sendto(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+You avoid unnecessary wakeup system calls when the driver is already processing work.
+
+9. What I would implement first
+Don't implement the DNS resolver immediately. Build this in milestones:
+
+AF_XDP implementation roadmap
+UMEM allocation
+
+Allocate 8 MiB, divide it into 2048-byte frames, and print frame offsets.
+
+First milestone
+UMEM registration
+
+Call xsk_umem__create() and successfully configure FILL and COMPLETION.
+
+AF_XDP socket
+
+Create XSK, bind to interface and queue, and configure RX/TX rings.
+
+XDP redirection
+
+Load XDP, populate XSKMAP, and redirect incoming packets.
+
+Packet inspection
+
+Receive one packet and print its Ethernet, IPv4, UDP and DNS fields.
+
+Buffer recycling
+
+Correctly consume RX, reclaim TX completions and refill FILL.
+
+Packet transmission
+
+Construct and send a simple response through TX.
+
+DNS integration
+
+Integrate your existing DNS parser, cache and response builder.
+
+10. Test yourself on the implementation details
+Layer 4 quiz
+
+6/6 answered
+1. What does xsk_umem__create() primarily establish?
+
+An XDP program
+UMEM registration and its FILL/COMPLETION rings
+The NIC's hardware RX queue
+Correct
+
+It creates/configures the UMEM arrangement and its two associated rings.
+
+2. What happens if XDP_ZEROCOPY is explicitly requested but unsupported?
+
+Automatically changes the descriptor format
+Bind fails
+UMEM offsets become virtual addresses
+Correct
+
+Explicitly forcing zero-copy means the kernel must provide it or fail the bind.
+
+3. What does xsk_ring_prod__submit() do?
+
+Immediately guarantees packet transmission
+Publishes reserved descriptors to the consumer
+Frees the UMEM frame
+Correct
+
+It publishes descriptors. Transmission processing and completion happen later.
+
+4. Why can't you reuse a TX frame immediately after submission?
+
+The DNS header is immutable
+The NIC/driver may still be accessing it
+The FILL ring owns every TX frame
+Correct
+
+Wait for the completion entry before reclaiming the transmitted frame.
+
+5. What does xsk_ring_cons__release() on RX accomplish?
+
+Returns the packet buffer directly to FILL
+Releases consumed RX ring entries
+Transmits the DNS response
+Correct
+
+RX ring-slot release and UMEM buffer recycling are separate operations.
+
+6. When should you call sendto() with XDP_USE_NEED_WAKEUP?
+
+After every packet regardless of state
+Only when the TX ring indicates a wakeup is required
+Only when the RX ring is empty
+Correct
+
+Check xsk_ring_prod__needs_wakeup() before issuing the TX kick.
+
+6/6
+Retry quiz
+My suggestion: Your next most valuable exercise is implementing Phases 1–3 in actual C using libbpf. Don't worry about huge pages or zero-copy initially. Get ordinary memory allocation, UMEM registration, socket binding and ring creation working first. Then we can inspect the actual structures and system calls one by one.
+
+For reference, keep the official Linux AF_XDP documentation open while implementing.
+
+This is the implementation-level layer of the architecture. We're moving from understanding what XDP and AF_XDP do to understanding how you would actually implement the system in C.
+
+I'll follow your five blocks, but I want to make sure you understand not just the definitions, but also the mechanics, the memory layout, and why each operation is necessary.
+
+There are three particularly important ideas here:
+
+The DNS message is embedded inside a packet that you must construct and transmit yourself.
+
+AF_XDP descriptors are references to memory, not copies of packets.
+
+Ring indices implement a producer-consumer protocol that controls who owns each buffer.
+
+Block A — The packet, byte by byte
+Let's start with the most important practical question:
+
+When a DNS query lands in UMEM, what exactly is sitting there?
+
+Suppose our client sends:
+
+Client:      192.0.2.10:53000
+DNS server:  198.51.100.53:53
+
+DNS query:   example.com
+Record type: A
+The packet stored in UMEM looks like this:
+
+UMEM frame contents
+Ethernet header — 14 bytes
+
+Destination MAC [6] | Source MAC [6] | EtherType [2]
+
+IPv4 header — 20 bytes (example)
+
+Version/IHL | Length | ID | Flags | TTL | Protocol | Checksum | Source IP | Destination IP
+
+UDP header — 8 bytes
+
+Source port [2] | Destination port [2] | Length [2] | Checksum [2]
+
+DNS message — 29 bytes (example)
+
+DNS header [12] | Question [17]
+
+Total: 71 bytes, excluding Ethernet FCS and any optional UMEM headroom before packet data.
+
+A1. Ethernet header
+The first 14 bytes:
+
+struct ethhdr {
+    unsigned char h_dest[6];
+    unsigned char h_source[6];
+    __be16 h_proto;
+};
+Field
+
+Size
+
+Meaning
+
+h_dest
+
+6
+
+Destination MAC
+
+h_source
+
+6
+
+Source MAC
+
+h_proto
+
+2
+
+Encapsulated protocol
+
+For IPv4:
+
+h_proto = htons(ETH_P_IP);
+Here, htons() converts a host-order integer to network byte order.
+
+Why do we swap MAC addresses?
+Suppose the incoming packet is:
+
+Source MAC:      AA:AA:AA:AA:AA:AA
+Destination MAC: BB:BB:BB:BB:BB:BB
+If the DNS server is replying directly to the same client on the same Ethernet link:
+
+Outgoing:
+
+Source MAC:      BB:BB:BB:BB:BB:BB
+Destination MAC: AA:AA:AA:AA:AA:AA
+In C:
+
+memcpy(tmp, eth->h_source, ETH_ALEN);
+
+memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+memcpy(eth->h_dest, tmp, ETH_ALEN);
+But remember an important networking detail: this is valid only when the original source MAC is the correct next-hop destination for the response.
+
+If the client is behind a router, the original destination MAC may belong to the router, not the DNS server. You must perform route/next-hop resolution rather than blindly swapping MACs.
+
+A2. IPv4 header
+The Linux kernel provides:
+
+struct iphdr {
+    __u8  ihl:4;
+    __u8  version:4;
+    __u8  tos;
+    __be16 tot_len;
+    __be16 id;
+    __be16 frag_off;
+    __u8  ttl;
+    __u8  protocol;
+    __sum16 check;
+    __be32 saddr;
+    __be32 daddr;
+};
+The bitfield ordering shown is the Linux convention; wire-format parsing should always use the correct platform definitions and network byte order.
+
+For our response:
+
+Incoming:
+    Source IP      = 192.0.2.10
+    Destination IP = 198.51.100.53
+
+Outgoing:
+    Source IP      = 198.51.100.53
+    Destination IP = 192.0.2.10
+In C:
+
+__be32 temp = ip->saddr;
+ip->saddr = ip->daddr;
+ip->daddr = temp;
+But swapping the addresses is not enough.
+
+You must update:
+
+tot_len if the response has a different size.
+
+ttl according to your outgoing packet policy.
+
+check, the IPv4 header checksum.
+
+The IPv4 header checksum is calculated over the entire IPv4 header, including options if present.
+
+Conceptually:
+
+function ipv4_checksum(ip_header, ihl):
+
+    checksum = 0
+
+    for each 16-bit word in IPv4 header:
+        checksum += word
+
+    fold carries into lower 16 bits
+
+    return one's_complement(checksum)
+The checksum field must be zeroed before computing the new checksum.
+
+A3. UDP header
+Linux provides:
+
+struct udphdr {
+    __be16 source;
+    __be16 dest;
+    __be16 len;
+    __sum16 check;
+};
+Incoming:
+
+Source port      = 53000
+Destination port = 53
+Outgoing:
+
+Source port      = 53
+Destination port = 53000
+In C:
+
+__be16 temp = udp->source;
+
+udp->source = udp->dest;
+udp->dest = temp;
+Then:
+
+udp->len = htons(sizeof(struct udphdr) + dns_response_len);
+Is the UDP checksum optional?
+For IPv4, yes.
+
+You can set:
+
+udp->check = 0;
+This indicates that no UDP checksum is supplied for an IPv4 UDP datagram.
+
+However:
+
+IPv6 UDP generally requires a checksum.
+
+If you choose to calculate an IPv4 UDP checksum, it includes the pseudo-header.
+
+The pseudo-header includes source IP, destination IP, protocol and UDP length.
+
+If you change IP addresses or UDP length, the old checksum is no longer valid.
+
+For your initial IPv4-only implementation, setting the UDP checksum to zero is a reasonable simplification.
+
+A4. DNS message
+This is where your existing resolver code becomes valuable.
+
+Your DNS logic can be separated from the networking layer.
+
+DNS module:
+
+    parse_dns_name()
+    parse_dns_header()
+    parse_dns_question()
+    cache_lookup()
+    resolve_upstream()
+    build_response()
+These functions should ideally operate on DNS message buffers and lengths, without depending on whether the message arrived through a normal UDP socket or AF_XDP.
+
+For example:
+
+uint8_t *dns_message = udp_start + sizeof(struct udphdr);
+
+size_t dns_length =
+    ntohs(udp->len) - sizeof(struct udphdr);
+
+struct dns_response response =
+    build_response(dns_message, dns_length);
+The DNS module doesn't need to know whether the packet came from:
+
+A conventional UDP socket using recvfrom().
+
+An AF_XDP RX ring.
+
+A test file containing a DNS message.
+
+That is good modular design.
+
+The key insight: You can reuse your DNS parser and response builder, but you must replace the normal socket's transport handling with your own packet framing, routing, checksum, and TX handling.
+
+Block B — The descriptor: the pivot of AF_XDP
+This is arguably the most important structure in the entire AF_XDP architecture.
+
+struct xdp_desc {
+    __u64 addr;
+    __u32 len;
+    __u32 options;
+};
+Let's understand why these three fields exist.
+
+Suppose our packet is stored in UMEM:
+
+UMEM base address = 0x10000000
+
+Frame 0: offset 0
+Frame 1: offset 2048
+Frame 2: offset 4096
+Frame 3: offset 6144
+A DNS query lands in Frame 1.
+
+The descriptor is:
+
+struct xdp_desc desc = {
+    .addr = 2048,
+    .len = 71,
+    .options = 0
+};
+What does it mean?
+
+addr = 2048
+    The packet begins at UMEM offset 2048.
+
+len = 71
+    The packet occupies 71 bytes.
+
+options = 0
+    No special descriptor options are set.
+The actual memory address used by the application is:
+
+uint8_t *packet = umem_area + desc.addr;
+Conceptually:
+
+UMEM base
+    |
+    v
+0x10000000
+    |
+    | + 2048
+    v
+0x10000800
+    |
+    v
++---------------------------------+
+| Ethernet | IP | UDP | DNS        |
++---------------------------------+
+|<------------ 71 bytes --------->|
+The descriptor is only 16 bytes. The packet is 71 bytes.
+
+The application does not receive a 71-byte copy through the RX ring. It receives a small descriptor telling it where the 71 bytes already reside.
+
+B1. Why do RX/TX need len, but FILL/COMPLETION don't?
+This is a very good conceptual question.
+
+Think about the purpose of each ring.
+
+Ring
+
+What it communicates
+
+Why length?
+
+FILL
+
+Here is an available buffer
+
+No packet exists in it yet
+
+RX
+
+Here is a received packet
+
+Must tell userspace how many bytes to parse
+
+TX
+
+Here is a packet to transmit
+
+Must tell the driver how many bytes to transmit
+
+COMPLETION
+
+This TX buffer is available again
+
+Only its address is needed to reclaim it
+
+Let's consider each one.
+
+FILL ring
+
+Userspace says:
+
+Kernel/driver:
+You may use the buffer at offset 2048.
+The kernel doesn't need a packet length because the buffer is empty and its capacity/layout is already known.
+
+RX ring
+
+After reception:
+
+Kernel/driver:
+I placed a packet at offset 2048.
+It occupies 71 bytes.
+Userspace needs the length because a frame might contain 71 bytes, 512 bytes, or 1500 bytes.
+
+TX ring
+
+Userspace says:
+
+Kernel/driver:
+Transmit the packet at offset 4096.
+It occupies 87 bytes.
+The driver needs the length to know what portion of the buffer to transmit.
+
+COMPLETION ring
+
+The driver says:
+
+Userspace:
+Transmission processing is complete.
+You can reclaim the buffer at offset 4096.
+The application already knows the buffer's capacity and doesn't need the old packet's length to recycle it.
+
+Remember this rule
+
+RX/TX = address + length
+FILL/COMPLETION = address only
+This describes the normal AF_XDP ring entry formats.
+
+Block C — UMEM addressing and headroom
+Now let's understand the relationship between:
+
+Frame index
+
+Frame size
+
+UMEM offset
+
+Headroom
+
+Actual pointer
+
+C1. Calculating the UMEM size
+Suppose:
+
+#define FRAME_SIZE  2048
+#define NUM_FRAMES  4096
+Then:
+
+\[ \text{UMEM size} = 2048 \times 4096 \]
+\[ = 8,388,608\text{ bytes}=8\text{ MiB} \]
+The UMEM allocation is one contiguous memory region from the application's perspective.
+
+void *umem_area = aligned_alloc(4096, 8 * 1024 * 1024);
+This is illustrative allocation code. A real implementation must satisfy the alignment and size requirements of its selected UMEM configuration.
+
+The frames are logical chunks within this region.
+
+C2. Frame index to offset
+Suppose you want Frame 3.
+
+Frame size = 2048
+Frame index = 3
+Then:
+
+\[ \text{offset}=3\times2048=6144 \]
+The corresponding pointer is:
+
+uint8_t *frame = (uint8_t *)umem_area + 6144;
+This is a virtual-memory pointer.
+
+The important distinction:
+
+6144
+    = offset within UMEM
+
+umem_area + 6144
+    = actual userspace virtual pointer
+AF_XDP descriptors normally use UMEM-relative addresses, not raw userspace pointers.
+
+C3. What does xsk_umem__get_data() do?
+The libbpf helper is essentially:
+
+static inline void *
+xsk_umem__get_data(void *umem_area, __u64 addr)
+{
+    return (__u8 *)umem_area + addr;
+}
+Usage:
+
+void *packet = xsk_umem__get_data(
+    umem_area,
+    desc->addr
+);
+You can then interpret it as packet bytes:
+
+struct ethhdr *eth = packet;
+And calculate the next header:
+
+struct iphdr *ip =
+    (struct iphdr *)((uint8_t *)packet +
+                     sizeof(struct ethhdr));
+This is only valid after checking that enough bytes exist for each header.
+
+C4. Headroom — Why do we need it?
+This is a subtle but important memory-management concept.
+
+Suppose you have a packet buffer:
+
+Frame:
++------------------------------------------------+
+| Packet data                                    |
++------------------------------------------------+
+Now suppose you want to prepend a new header.
+
+If there is no space before the packet, you may have to move the entire payload to make room.
+
+That means copying bytes.
+
+Instead, reserve some space before the packet data:
+
+Frame:
++--------------------+---------------------------+
+| HEADROOM           | PACKET DATA               |
+|                    | Ethernet | IP | UDP | DNS |
++--------------------+---------------------------+
+For example:
+
+Frame size = 2048 bytes
+Headroom = 256 bytes
+Available packet capacity = 1792 bytes
+If the packet starts at offset 256 relative to the frame, you can prepend data by moving the logical packet start backwards into the reserved space.
+
+Conceptually:
+
+Before:
+
+[ HEADROOM: 256 bytes ][ DNS payload ]
+
+After prepending headers:
+
+[ Ethernet ][ IP ][ UDP ][ DNS payload ]
+The important detail is that headroom is not necessarily part of the packet's reported length.
+
+One important AF_XDP addressing nuance
+Don't blindly assume that every descriptor address is:
+
+frame_index * frame_size + headroom
+The actual address depends on how the UMEM is configured and how the frame is supplied and consumed.
+
+In particular:
+
+UMEM has a configured headroom.
+
+The kernel/driver observes the AF_XDP headroom convention.
+
+FILL addresses and RX descriptor addresses must be interpreted according to that convention.
+
+xsk_umem__get_data() simply adds the supplied address to the UMEM base. It does not automatically add another headroom offset.
+
+This distinction matters because accidentally adding headroom twice shifts your packet pointer and causes incorrect header parsing.
+
+Also, headroom is not a magic way to avoid copying when a response is larger than a query. It gives space to prepend headers to an existing payload. If the DNS response itself is larger, you may need a separate buffer or construct the response elsewhere.
+
+For a DNS resolver, the simplest approach is usually to build the response in a separate TX frame rather than modifying the original RX frame.
+
+Block D — Ring mechanics: producer and consumer indices
+Now we're getting into the actual mechanics behind AF_XDP.
+
+Each ring is a circular buffer with:
+
+An array of entries.
+
+A producer index.
+
+A consumer index.
+
+A finite capacity.
+
+Let's build one ourselves conceptually.
+
+D1. A ring of size 4
+Ring capacity = 4
+
+Slot:     0       1       2       3
+       +-------+-------+-------+-------+
+       |       |       |       |       |
+       +-------+-------+-------+-------+
+
+Producer index = 0
+Consumer index = 0
+The ring is empty because:
+
+\[ producer=consumer \]
+Now userspace publishes a buffer address:
+
+producer = 1
+consumer = 0
+
+Slot 0 = 2048
+The kernel can consume that entry.
+
+After consuming:
+
+producer = 1
+consumer = 1
+The ring becomes empty again.
+
+D2. How do we determine empty and full?
+Let:
+
+\(P\) = producer index.
+
+\(C\) = consumer index.
+
+\(N\) = ring size.
+
+Then:
+
+\[ \text{Available entries}=P-C \]
+\[ \text{Empty}\iff P=C \]
+\[ \text{Full}\iff P-C=N \]
+This assumes the indices are maintained using the ring's prescribed synchronization and capacity rules.
+
+D3. Why do we use a mask?
+AF_XDP rings commonly use power-of-two sizes.
+
+Suppose:
+
+N = 4
+Mask = N - 1 = 3
+
+Binary:
+3 = 00000011
+The array index is:
+
+\[ \text{slot}=index\ \&\ (N-1) \]
+Let's see:
+
+Index
+
+Binary (low bits)
+
+Mask
+
+Slot
+
+0
+
+000
+
+011
+
+0
+
+1
+
+001
+
+011
+
+1
+
+2
+
+010
+
+011
+
+2
+
+3
+
+011
+
+011
+
+3
+
+4
+
+100
+
+011
+
+0
+
+5
+
+101
+
+011
+
+1
+
+6
+
+110
+
+011
+
+2
+
+7
+
+111
+
+011
+
+3
+
+Notice that the logical producer index keeps increasing, but the physical array position wraps around.
+
+This is why we don't need to reset the index to zero whenever the array ends.
+
+D4. Who modifies which index?
+This table is essential.
+
+Ring
+
+Producer
+
+Consumer
+
+FILL
+
+Userspace
+
+Kernel/driver
+
+RX
+
+Kernel/driver
+
+Userspace
+
+TX
+
+Userspace
+
+Kernel/driver
+
+COMPLETION
+
+Kernel/driver
+
+Userspace
+
+Let's examine the actual sequence.
+
+Example: FILL ring
+Userspace wants to make Frame A available.
+
+Producer index = 0
+Consumer index = 0
+It writes:
+
+fill_ring[0] = 2048;
+Then publishes the new producer index:
+
+Producer index = 1
+Consumer index = 0
+The kernel sees that one entry is available and consumes it.
+
+Producer index = 1
+Consumer index = 1
+The frame is now available for receiving.
+
+Example: RX ring
+The NIC receives the DNS query.
+
+The kernel/driver writes:
+
+rx_ring[0] = {
+    .addr = 2048,
+    .len = 71,
+    .options = 0
+};
+Then it publishes the producer index.
+
+Userspace reads the descriptor and advances the consumer index.
+
+Example: TX ring
+Userspace prepares a DNS response in Frame B.
+
+tx_ring[0] = {
+    .addr = 4096,
+    .len = 87,
+    .options = 0
+};
+It advances the producer index, and the kernel/driver consumes the descriptor.
+
+Example: COMPLETION ring
+After transmission processing finishes, the kernel/driver publishes the reclaimed address.
+
+completion_ring[0] = 4096;
+Userspace consumes that address and can make Frame B available for reuse.
+
+D5. One critical implementation detail: memory barriers
+You might ask:
+
+Why can't userspace simply write a descriptor and immediately increment the producer index?
+
+Because concurrent execution and CPU memory ordering matter.
+
+Imagine:
+
+Thread A: write descriptor
+Thread A: update producer index
+
+Thread B: read producer index
+Thread B: read descriptor
+Without the appropriate synchronization, Thread B could observe the updated index before it observes the descriptor contents.
+
+That would be disastrous.
+
+The producer must publish the descriptor before publishing the index. The consumer must observe the index before reading the corresponding descriptor.
+
+The kernel's AF_XDP ring helpers and libbpf's ring APIs implement the required memory-ordering semantics.
+
+For actual C implementation, don't manually manipulate AF_XDP ring indices unless you really understand the memory model. Use the provided helpers.
+
+For example:
+
+xsk_ring_prod__reserve(&tx, 1, &idx);
+
+struct xdp_desc *desc =
+    xsk_ring_prod__tx_desc(&tx, idx);
+
+desc->addr = tx_addr;
+desc->len = response_len;
+
+xsk_ring_prod__submit(&tx, 1);
+This is the kind of code you will actually encounter in an AF_XDP application.
+
+Block E — XSKMAP: the connection between XDP and AF_XDP
+This is comparatively simple, but let's understand the actual kernel objects and how userspace configures them.
+
+E1. What is XSKMAP?
+XSKMAP is a BPF map of type:
+
+BPF_MAP_TYPE_XSKMAP
+It stores AF_XDP socket references.
+
+Conceptually:
+
+XSKMAP
+
+Key                 Value
+--------------------------------
+0                   XSK socket 0
+1                   XSK socket 1
+2                   XSK socket 2
+3                   XSK socket 3
+The key is typically a 32-bit integer. The value represents an AF_XDP socket reference managed by the kernel, not simply an arbitrary pointer to a userspace object.
+
+E2. How do we populate it?
+The userspace application:
+
+Creates an AF_XDP socket.
+
+Binds it to a network interface and RX queue.
+
+Obtains its socket file descriptor.
+
+Inserts that socket into XSKMAP.
+
+Conceptually:
+
+int xsk_fd = socket(AF_XDP, SOCK_RAW, 0);
+
+/* Configure UMEM and rings, then bind socket. */
+
+__u32 key = 0;
+
+bpf_map_update_elem(
+    xsks_map_fd,
+    &key,
+    &xsk_fd,
+    BPF_ANY
+);
+Here:
+
+xsks_map_fd is the file descriptor of the BPF map.
+
+key identifies the map entry.
+
+xsk_fd identifies the AF_XDP socket.
+
+BPF_ANY allows the entry to be created or replaced.
+
+The socket must be appropriately configured and bound before it can be used for redirection.
+
+E3. How does XDP use the map?
+In the XDP program:
+
+return bpf_redirect_map(
+    &xsks_map,
+    ctx->rx_queue_index,
+    XDP_PASS
+);
+The complete relationship:
+
+Userspace:
+    Create XSK0
+       |
+       v
+    Bind to eth0, queue 0
+       |
+       v
+    Insert XSK0 into XSKMAP[0]
+
+
+Kernel:
+    Packet arrives on queue 0
+       |
+       v
+    XDP reads rx_queue_index = 0
+       |
+       v
+    bpf_redirect_map()
+       |
+       v
+    XSKMAP[0]
+       |
+       v
+    XSK0
+       |
+       v
+    AF_XDP RX ring
+       |
+       v
+    Userspace worker 0
+That's essentially all you need to understand about XSKMAP for this architecture.
+
+8. Putting all five blocks together: four queries and three frames
+Let's do a complete walkthrough. This is where all the concepts should connect.
+
+Suppose:
+
+UMEM:
+    Frame A = offset 0
+    Frame B = offset 2048
+    Frame C = offset 4096
+
+Frame size = 2048 bytes
+
+AF_XDP socket = XSK0
+RX queue = 0
+We have four incoming DNS queries:
+
+Q1: example.com
+Q2: google.com
+Q3: openai.com
+Q4: github.com
+Assume the application can process only three frames at a time.
+
+Initial state
+Userspace supplies all three frames to the FILL ring.
+
+FILL:
+    0
+    2048
+    4096
+
+RX:
+    Empty
+
+TX:
+    Empty
+
+COMPLETION:
+    Empty
+Ownership:
+
+Frame
+
+Owner/state
+
+A
+
+Kernel/driver, available for RX
+
+B
+
+Kernel/driver, available for RX
+
+C
+
+Kernel/driver, available for RX
+
+Query 1 arrives
+NIC receives Q1.
+
+NIC -> XDP -> XSKMAP[0] -> XSK0
+The driver uses Frame A.
+
+RX ring gets:
+
+{ .addr = 0, .len = 71, .options = 0 }
+Userspace consumes Q1 and begins DNS resolution.
+
+Ownership:
+
+Frame
+
+State
+
+A
+
+Userspace processing Q1
+
+B
+
+Available for RX
+
+C
+
+Available for RX
+
+Query 2 arrives
+NIC receives Q2.
+
+Frame B is used.
+
+{ .addr = 2048, .len = 71, .options = 0 }
+Userspace consumes Q2.
+
+Frame
+
+State
+
+A
+
+Userspace processing Q1
+
+B
+
+Userspace processing Q2
+
+C
+
+Available for RX
+
+Query 3 arrives
+Frame C is used.
+
+{ .addr = 4096, .len = 71, .options = 0 }
+Now:
+
+Frame
+
+State
+
+A
+
+Userspace processing Q1
+
+B
+
+Userspace processing Q2
+
+C
+
+Userspace processing Q3
+
+Query 4 arrives
+There are no free RX frames.
+
+What happens?
+
+The NIC cannot magically create another UMEM frame.
+
+If no receive buffer is available, the packet cannot be delivered through this AF_XDP receive path. It may be dropped, and the application needs to monitor drops and replenish buffers.
+
+This is called receive-buffer starvation.
+
+Q1 finishes processing
+Userspace has completed Q1's DNS processing.
+
+It can recycle Frame A by submitting offset 0 to the FILL ring, provided it no longer needs the original packet.
+
+FILL:
+    0
+Now the kernel/driver can use Frame A again.
+
+Q4 can potentially be received in Frame A.
+
+The cycle continues.
+
+This is the reason that buffer recycling is so important in AF_XDP. It is not enough to process packets correctly; you must also return memory to the receive pipeline quickly enough.
+
+A further implementation detail: with only three frames, you may also need separate TX buffers. If you retain an RX buffer while preparing or transmitting its response, that buffer cannot simultaneously be returned to FILL. In a real design, use a properly sized buffer pool and separate RX/TX ownership tracking.
+
+9. The actual C implementation structure you should aim for
+Now that you understand the five blocks, here's how I'd divide the implementation into C modules.
+
+dns_xdp_project/
+|
++-- main.c
+|     |
+|     +-- initialize everything
+|     +-- start workers
+|
++-- xdp_kern.c
+|     |
+|     +-- XDP program
+|     +-- packet classification
+|     +-- XSKMAP redirect
+|
++-- af_xdp.c
+|     |
+|     +-- create AF_XDP socket
+|     +-- register UMEM
+|     +-- configure rings
+|     +-- bind socket
+|
++-- umem.c
+|     |
+|     +-- allocate frames
+|     +-- track free frames
+|     +-- track buffer ownership
+|
++-- packet_parser.c
+|     |
+|     +-- parse Ethernet
+|     +-- parse IPv4
+|     +-- parse UDP
+|     +-- build outgoing headers
+|     +-- calculate checksums
+|
++-- dns.c
+|     |
+|     +-- parse DNS message
+|     +-- parse DNS name
+|     +-- resolve DNS question
+|     +-- build DNS response
+|
++-- worker.c
+      |
+      +-- consume RX
+      +-- process packets
+      +-- submit TX
+      +-- reclaim completions
+      +-- replenish FILL
+This gives you clean boundaries:
+
+xdp_kern.c is kernel-side eBPF code.
+
+Everything else is userspace C.
+
+dns.c can potentially reuse much of your existing resolver logic.
+
+packet_parser.c is the new networking work you need to implement.
+
+10. The five things I want you to be able to explain without notes
+Block
+
+Question you should be able to answer
+
+A — Packet
+
+Why do we need to construct Ethernet/IP/UDP headers ourselves?
+
+B — Descriptor
+
+Why does RX contain addr + len, while FILL contains only addr?
+
+C — UMEM
+
+Why is desc->addr an offset rather than a pointer?
+
+D — Rings
+
+Who produces and consumes each ring, and how is ownership transferred?
+
+E — XSKMAP
+
+How does the XDP program select the correct AF_XDP socket?
+
+One additional detail worth remembering: the AF_XDP APIs provide helpers for reserving and submitting ring entries. Your application should use those helpers rather than implementing its own producer/consumer index updates against the kernel's shared rings.
+
+The official references are:
+
+Linux AF_XDP documentation
+
+Linux XDP documentation
+
+libbpf AF_XDP API
+
+My recommendation for the next step is to implement a single-packet AF_XDP receive-and-inspect program in C before implementing DNS resolution.
+
+It should:
+
+Allocate UMEM with 2048-byte frames.
+
+Create one AF_XDP socket.
+
+Attach a minimal XDP program.
+
+Populate XSKMAP.
+
+Receive one packet through the RX ring.
+
+Print the descriptor's addr and len.
+
+Print Ethernet, IPv4 and UDP fields directly from UMEM.
+
+Recycle the frame through FILL.
+
+Once this works, you will have implemented the entire Layer 1-to-Layer 2 handoff. DNS resolution and TX can then be added independently.
+
+Check this:
+
+This material is a real step up — it's accurate on the things tutorials usually get wrong. But it has a few gaps that will cost you a day each, and one of them will stop your very first build.
+
+## Updated layer scorecard (Stack B)
+
+| Layer | Before | Now |
+|---|---|---|
+| L1 mental model | ✅ | ✅ |
+| L2 data flow | ✅ | ✅ |
+| L3 state/structures | ◐ half | ✅ (Blocks A–E) |
+| L4 interfaces | ❌ | ◐ ~three-quarters |
+| L5 bare code | ❌ | ❌ |
+
+So you went from ~2.5 layers to ~4. The remaining L4 quarter is small in volume but high in debugging cost.
+
+## What it got right that most sources don't
+
+Worth naming, because these are the non-obvious ones and you should keep them: the warning that **releasing an RX descriptor ≠ recycling its UMEM frame** (two separate operations, and conflating them is the classic AF_XDP memory bug); the correction that **TX completions ≠ the number of frames to refill into FILL** (you need a real free-frame pool, not a 1:1 assumption); the **MAC-swap caveat** that blind swapping is only valid when the source MAC is the correct next hop; and the **headroom double-add warning** on `xsk_umem__get_data`. Also correct: explicit `XDP_ZEROCOPY` fails the bind rather than silently falling back, and you should read `XDP_OPTIONS_ZEROCOPY` rather than assume you got what you asked for.
+
+## What will actually bite you
+
+**1. `bpf/xsk.h` does not exist on your system.** This is the one that stops your first `gcc`. The AF_XDP helper API (`xsk_umem__create`, `xsk_socket__create`, all the ring helpers) was deprecated in libbpf 1.0 and **removed** — it now lives in **libxdp**. Your WSL is Ubuntu 24.04 (I saw the bind 9.18-0ubuntu0.24.04 version earlier), which ships libbpf 1.3+. So:
+
+```bash
+sudo apt install -y libxdp-dev libbpf-dev clang llvm
+```
+```c
+#include <xdp/xsk.h>     /* NOT <bpf/xsk.h> */
+```
+```bash
+gcc ... -lxdp -lbpf
+```
+
+Every code snippet in that document assumes the old libbpf location. The function names are unchanged, so it's a one-line fix — but only if you know it, otherwise it reads as "the tutorial is wrong about everything."
+
+**2. libbpf/libxdp will load its *own* XDP program and silently ignore yours.** Phase 3 sets `.libbpf_flags = 0`. With that, `xsk_socket__create` loads a built-in default XDP program onto the interface and manages its own internal xsks_map. Then Phase 4 loads *your* `xdp_kern.o` and populates *your* map — and the two fight. Symptom: packets arrive, your program's counters move or don't, and nothing ever lands in your RX ring. You need:
+
+```c
+.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+```
+
+This also resolves the ordering contradiction in section 4.5 — it says "populate XSKMAP before attaching the program," but with `libbpf_flags = 0` a program is already attached at socket-create time, before step 4 even runs.
+
+**3. `XDP_USE_NEED_WAKEUP` is explained but never enabled.** Phase 5D correctly teaches `xsk_ring_prod__needs_wakeup()`, but Phase 3's config is `.bind_flags = XDP_COPY`. That helper only ever returns meaningful values if you bound with the flag set:
+
+```c
+.bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP,
+```
+
+Without it, `needs_wakeup()` returns false forever, you never call `sendto()`, and your responses sit in the TX ring undelivered. Same applies on the RX side — the doc mentions FILL has a wakeup but the loop never shows it:
+
+```c
+if (xsk_ring_prod__needs_wakeup(&fill_ring))
+    recvfrom(xsk_fd, NULL, 0, MSG_DONTWAIT, NULL, NULL);
+```
+
+**4. Multi-queue NICs will make it work "sometimes."** The XDP program uses `ctx->rx_queue_index` as the XSKMAP key, and you populate only key 0 with a socket bound to queue 0. If the interface has 8 RX queues, RSS spreads packets across all of them, and anything landing on queue 3 finds an empty map entry and falls through to `XDP_PASS`. You'll see maybe 1-in-8 queries reach your resolver. Pin the interface to one queue before testing:
+
+```bash
+ethtool -l eth0          # show current queue count
+sudo ethtool -L eth0 combined 1
+```
+
+The doc never flags this and it's the single most common "my AF_XDP program drops packets randomly" cause.
+
+**5. Aligned vs unaligned UMEM is gestured at but never named.** Block C correctly warns "don't assume `addr = frame_index * frame_size + headroom`" — but then doesn't explain *why*. The actual mechanism: UMEM has two modes. In **aligned** mode (default, `flags = 0`), descriptor addresses are frame-aligned and your arithmetic works. In **unaligned** mode (`XDP_UMEM_UNALIGNED_CHUNK_FLAG`), the address packs the frame index in the high bits and a byte offset in the low bits, and you must use `xsk_umem__extract_addr()` and `xsk_umem__extract_offset()`. Stay in aligned mode for this project and the warning becomes moot — but you should know which mode you're in rather than treating it as mystery.
+
+**6. `RLIMIT_MEMLOCK`.** UMEM pages get pinned. On kernels before 5.11 (and some configurations after), you need this before any BPF or UMEM call or you get a confusing `EPERM`/`ENOMEM`:
+
+```c
+struct rlimit r = { RLIM_INFINITY, RLIM_INFINITY };
+setrlimit(RLIMIT_MEMLOCK, &r);
+```
+
+**7. The two documents contradict each other on frame reuse.** The earlier walkthrough (the 4-query/3-frame one) reuses F0 for Q1's *response*. The newer one says "allocate a DIFFERENT free frame for TX" and is right — reusing the RX frame means you can't return it to FILL while the response is in flight, which with a small pool deadlocks you. Go with the newer advice. Also note the earlier doc's "3 frames" example is pedagogically fine but operationally absurd; use 4096.
+
+## The hole neither document touches
+
+Both docs frame the resolver as "parse query → resolve → build response → TX." That's a **forwarder or a cache-only resolver**. Your resolver is recursive — it sends its *own* queries out to root/TLD/authoritative servers and waits for replies. Neither document addresses what that does to the packet path, and it's the biggest architectural decision left:
+
+- Your XDP program filters on `udp dst port 53`. Replies from upstream nameservers arrive with **src port 53**, dst = your ephemeral port. They won't match your filter, so they'd go up the normal stack — which may be what you want.
+- If you widen the filter to catch them, you now need the full iterative state machine driven off the RX ring, and you must construct outbound queries as complete Ethernet/IP/UDP frames with correct next-hop MACs (ARP, routing) for servers that are *not* on your local link. That's genuinely hard and far beyond the project's scope.
+- Also: your resolver listens on **5353**, not 53. The XDP filter in both docs says 53.
+
+The sane design, and the one I'd defend in your report: **hybrid.** AF_XDP handles the client-facing path (queries in, responses out). Upstream queries keep using the ordinary UDP socket your `recursive_resolver.c` already has. You benchmark in `--local` mode, where there *is* no upstream traffic, so the hybrid boundary doesn't pollute the measurement. Decide this with your team before anyone writes `xdp_kern.c`, because it determines what the filter matches.
+
+## What I'd do with this
+
+The material's own closing advice is right and you should follow it literally: build a **receive-and-inspect program only** — UMEM, socket, minimal XDP program, XSKMAP, print `desc->addr`/`desc->len` and the Ethernet/IP/UDP fields, recycle to FILL. No DNS, no TX. That's the smallest thing that proves items 1–6 above are all configured correctly, and every one of them fails loudly in that program rather than mysteriously in a full resolver.
+
+Before that, one command to run in WSL, because it decides whether any of this works there at all:
+
+```bash
+zcat /proc/config.gz 2>/dev/null | grep -E 'XDP_SOCKETS|CONFIG_BPF_SYSCALL' \
+  || grep -E 'XDP_SOCKETS|CONFIG_BPF_SYSCALL' /boot/config-$(uname -r)
+```
+
+If `CONFIG_XDP_SOCKETS=y` isn't there, the WSL2 kernel can't do AF_XDP at all and you need a real Linux box or a proper VM — which is a scheduling problem, not a code problem, so find out now rather than in week three.
+
+Give a ChatGPT prompt for L3/L4 of Recursive resolver
+
+Paste this into ChatGPT, and attach `recursive_resolver.c` so it can tie the concepts to real code. It's written to get the same style of answer you liked for AF_XDP: ordered phases, worked byte-level examples, corrections, and a quiz.
+
+```
+I'm building a recursive DNS resolver in C as part of a course project. My instructor wants a top-down understanding: concept → architecture → data structures → interfaces/APIs → bare code. I've already covered Layer 1 (mental model: recursive vs iterative, root → TLD → authoritative, referrals, glue, CNAME, caching) and Layer 2 (data flow of one query through the resolver). I now need Layer 3 (state and data structures) and Layer 4 (interfaces: syscalls, library calls, byte layouts) for the recursive resolver. Do NOT write the full implementation. I want to understand every piece well enough that writing it is mechanical.
+
+Scope: IPv4 only, UDP only, A and AAAA queries, a single-threaded epoll event loop, with upstream queries to real nameservers. It must be correct and benchmarkable, not production-grade. I've attached my current implementation (recursive_resolver.c). Use it as a reference, but teach the concepts independently, and at the end tell me where my code diverges from what you taught.
+
+LAYER 3: STATE AND DATA STRUCTURES. For each structure, explain what it must remember, why it exists, its fields and their sizes, its lifecycle (created → updated → destroyed), and what goes wrong if it's designed badly:
+1. The pending-query table: one entry per in-flight client request. Cover the fields needed (client address and TXID, current qname/qtype, current nameserver, depth counter, CNAME counter, per-hop and overall deadlines, remaining NS candidates). Cover how upstream replies are matched back to entries (TXID plus source port plus source IP plus question match) and the cost of linear scan vs hash lookup.
+2. The cache: key (name, type, class), TTL handling (absolute expiry vs remaining TTL, TTL decrement when serving), what to cache (answers, delegations/NS+glue, CNAMEs, negative answers), eviction policy, and the difference between NXDOMAIN and NODATA.
+3. The nameserver selection state: the NS list from a referral, which were tried, retry and failover order, and the root hints as bootstrap state.
+4. The resolution state machine: draw it out (states, events, transitions): start → query sent → referral → answer → CNAME restart → glueless sub-query → failure/timeout → SERVFAIL. Explain how a glueless delegation requires pausing the parent query and spawning a child query, and what data structure change that implies (parent/child links).
+5. Loop and budget limits: max referral depth, max CNAME chain, max total upstream queries per client request, and what attacks these defend against.
+
+LAYER 4: INTERFACES. Cover in execution order, with exact function signatures and what each argument means:
+1. The DNS wire format at byte level: the 12-byte header with exact bit positions of QR, OPCODE, AA, TC, RD, RA, Z, AD, CD, RCODE; the question section; the resource record format (NAME, TYPE, CLASS, TTL, RDLENGTH, RDATA); name encoding with length-prefixed labels; and name compression (0xC0 pointers), including how to parse safely without infinite loops. Walk through ONE complete real example: a query for www.example.com A and a referral response from a .com server, as annotated hex bytes, showing the answer, authority (NS) and additional (glue A) sections.
+2. How to distinguish a referral, an answer, a CNAME, NXDOMAIN and NODATA by looking only at the response header and section counts. Include the exact decision logic.
+3. The socket and event-loop calls: socket, bind, recvfrom, sendto, epoll_create1, epoll_ctl, epoll_wait with a timeout for deadlines, SOCK_NONBLOCK and EAGAIN handling, and how timers/deadlines are managed in a single-threaded loop.
+4. Randomness and anti-spoofing: getrandom for TXIDs, why source-port randomization matters (the Kaminsky attack), how to randomize ports with one vs many sockets, and bailiwick checking (why a .com server must not be trusted for records outside its zone).
+5. Truncation and EDNS: the TC bit and TCP fallback, the 512-byte limit vs EDNS0 OPT records, and what a minimal resolver should do about each.
+6. Time APIs: clock_gettime(CLOCK_MONOTONIC) and why not wall-clock time for TTLs.
+
+FORMAT. Go phase by phase in execution order. Use small ASCII diagrams, annotated byte dumps and short C snippets (signatures and usage, not a full program). Before each phase, list the common mistakes and corrections beginners make. Mark clearly anything that is a simplification vs what real resolvers (Unbound, BIND) do. If you're unsure about something, say so instead of guessing. End with: (a) a table mapping each concept to the exact syscall or struct it uses, (b) a review of my attached code listing specific bugs, gaps or divergences from what you taught, and (c) a 10-question quiz with answers and explanations.
+```
+
+Two tips for using it:
+
+- If the answer comes back too long, ask for "Layer 3 only" first, then "Layer 4 only". Both layers in one response will be shallow.
+- Check what it says about glueless delegation and bailiwick against `recursive_resolver.c`. Both are known gaps in our code, so a good answer should flag them in part (b).

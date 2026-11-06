@@ -1,0 +1,437 @@
+Check out this problem statement of this project , tell me what is the architecture
+and
+what is my teammate yapping about
+Me and Adil are planning this workflow:
+1. We'll start UDP resolver. 
+2. Benchmark it
+3. Then over to someone will be spending that time looking at XDP socket
+4. XDP team will replace UDP socket with XDP socket and benchmark
+
+Your project is essentially a performance comparison between a conventional UDP-based DNS resolver and an AF_XDP-based DNS resolver.
+
+The important thing is that you're not building two completely different DNS resolvers. You're ideally building one DNS resolution engine with two different networking backends.
+
+That distinction will save you a lot of duplicated work.
+
+## 1. What architecture are you supposed to build?
+
+Think of it as three layers:
+
+1. DNS resolution logic: Understands DNS queries, finds the answers, and constructs DNS responses.
+2. Networking layer: Receives incoming DNS packets and sends responses. You will implement this in two ways: UDP sockets and AF_XDP sockets.
+3. Benchmarking layer: Sends DNS queries, measures performance, and compares the two networking approaches.
+
+High-level architecture
+
+DNS Client / Benchmark Tool
+
+Sends DNS queries and measures response time
+
+UDP backend
+
+Socket API
+
+AF_XDP backend
+
+XDP + XSK rings + UMEM
+
+Shared DNS resolution engine
+
+Parse query → resolve domain → construct DNS response
+
+Benchmark and comparison
+
+Throughput · Latency · CPU overhead
+
+## 2. What happens inside each architecture?
+
+### A. Conventional UDP resolver
+
+Client sends DNS query
+
+UDP socket (`recvfrom`)
+
+Linux kernel handles network packet processing
+
+DNS resolver
+
+Parse → resolve → construct response
+
+UDP socket (`sendto`)
+
+Client receives DNS response
+
+This is the relatively straightforward implementation.
+
+Your program binds to UDP port 53, receives DNS messages, processes them, and sends responses.
+
+### B. AF_XDP resolver
+
+This is where things get interesting.
+
+Incoming Ethernet frame
+
+XDP kernel program
+
+Checks packet headers and detects UDP destination port 53
+
+XSKMAP redirect
+
+Redirects packet to the appropriate AF_XDP socket
+
+AF_XDP userspace application
+
+RX ring → UMEM → parse Ethernet/IP/UDP headers
+
+Shared DNS resolver
+
+Process DNS query and construct DNS response
+
+AF_XDP TX ring
+
+Construct Ethernet/IP/UDP/DNS response and transmit
+
+Client receives DNS response
+
+Your teammate will probably be talking about these AF_XDP components:
+
+| Component       | What it does                                                     |
+| --------------- | ---------------------------------------------------------------- |
+| XDP program     | Runs in the kernel and decides what to do with incoming packets. |
+| XSKMAP          | Maps an XDP redirect to an AF_XDP socket.                        |
+| UMEM            | Shared packet-buffer memory used by AF_XDP.                      |
+| RX ring         | Passes received packet descriptors to userspace.                 |
+| TX ring         | Passes outgoing packet descriptors for transmission.             |
+| Fill ring       | Supplies available buffers for incoming packets.                 |
+| Completion ring | Notifies userspace when transmitted buffers can be reused.       |
+
+The important difference: UDP gives you DNS payloads; AF_XDP gives you packet frames.
+
+With UDP, the kernel does much of the network-stack work for you. With AF_XDP, your userspace application takes responsibility for more of that work, including parsing headers, managing buffers, and constructing packets.
+
+That's the actual engineering work involved. AF_XDP isn't simply another version of `recvfrom()`.
+
+## 3. What is your teammate actually proposing?
+
+Your proposed workflow:
+
+1. Build UDP resolver.
+2. Benchmark UDP resolver.
+3. Someone investigates AF_XDP.
+4. AF_XDP team replaces the UDP networking layer.
+5. Benchmark AF_XDP and compare.
+
+The plan is fundamentally correct. I'd make one important adjustment: steps 1–3 should happen in parallel wherever possible.
+
+There is no reason to wait until the UDP implementation and benchmark are complete before someone starts understanding AF_XDP.
+
+Here's how I'd organise it.
+
+## 4. Recommended team workflow
+
+1. Build the shared DNS resolution engine
+
+   You and Adil implement the DNS processing logic. Keep it independent of whether the query arrived through UDP or AF_XDP.
+
+   Its interface should ideally look something like:
+   ```
+   int process_dns_query(
+       const uint8_t *query,
+       size_t query_len,
+       uint8_t *response,
+       size_t *response_len
+   );
+   ```
+   This is illustrative; adapt it to your existing resolver code.
+2. Implement the UDP networking backend
+
+   Build a working UDP server using `socket()`, `bind()`, `recvfrom()` and `sendto()`.
+
+   Integrate the shared DNS engine and get the complete resolver working.
+3. Benchmark the UDP implementation
+
+   Start with a stub resolver to measure networking and packet-processing overhead without introducing variability from external DNS lookups.
+
+   Then benchmark the real iterative resolver separately.
+
+   Record:
+   - Queries per second (QPS).
+   - p50, p95 and p99 latency.
+   - CPU utilisation.
+   - Packet drops and failed queries.
+4. In parallel, investigate AF_XDP
+
+   Assign someone to work on:
+   - XDP program and attachment.
+   - AF_XDP socket creation and binding.
+   - UMEM allocation.
+   - RX/TX ring management.
+   - XSKMAP redirection.
+   - Receiving and transmitting actual packets.
+   The goal is to get a minimal AF_XDP packet receiver and transmitter working independently.
+5. Integrate AF_XDP with the DNS engine
+
+   Replace the UDP-facing networking backend with AF_XDP.
+
+   Reuse the same DNS processing logic. Do not rewrite your entire resolver just to accommodate AF_XDP.
+6. Benchmark AF_XDP and compare
+
+   Run the same workload against both backends under equivalent conditions.
+
+   Compare throughput, latency, CPU overhead and implementation complexity.
+
+## 5. One architectural detail you should discuss
+
+Your project mentions a real iterative DNS resolver.
+
+An iterative resolver doesn't merely respond to incoming queries. It can also contact root servers, TLD servers and authoritative DNS servers to find the answer.
+
+You need to decide whether AF_XDP handles:
+
+- Only client-facing DNS traffic, while upstream DNS queries continue using conventional UDP sockets.
+- Both incoming client traffic and outgoing upstream DNS traffic.
+
+I'd recommend the first approach unless your project specifically requires AF_XDP for all DNS networking. It reduces implementation complexity and makes the comparison much easier to manage.
+
+## 6. How I'd divide the responsibilities
+
+| Responsibility                | Suggested ownership    |
+| ----------------------------- | ---------------------- |
+| DNS resolution engine         | You + Adil             |
+| UDP backend                   | You + Adil             |
+| UDP benchmarking              | Shared                 |
+| AF_XDP research and prototype | Teammate(s)            |
+| AF_XDP integration            | AF_XDP team + DNS team |
+| Final comparison and report   | Everyone               |
+
+## 7. What I would tell your teammates
+
+Here's the central idea I'd communicate:
+
+I think we should separate the DNS resolution logic from the networking layer.
+
+First, we'll build a working UDP resolver and benchmark it as our baseline. In parallel, someone can investigate AF_XDP and get the XDP program, UMEM, rings and socket setup working independently.
+
+Once both sides are ready, we integrate AF_XDP with the existing DNS resolution engine rather than rewriting the resolver. Then we benchmark both implementations using the same workload and compare QPS, latency and CPU overhead.
+
+This way, we can isolate the actual performance difference introduced by AF_XDP instead of comparing two different resolver implementations.
+
+My verdict: Your workflow is good. The one thing I'd strongly insist on is a shared DNS resolution engine with separate UDP and AF_XDP networking backends.
+
+Otherwise, you'll end up maintaining two DNS resolvers, debugging two sets of resolution logic, and potentially comparing different implementations rather than comparing networking technologies. That's unnecessary work.
+
+Is it recursive resolver
+
+Yes. Your project is implementing a recursive DNS resolver using two different networking mechanisms: UDP and AF_XDP.
+
+There is an important distinction:
+
+- Recursive resolver: Takes a client's DNS query and obtains the final answer on the client's behalf.
+- Iterative resolver: Queries DNS servers step by step, following referrals from root → TLD → authoritative DNS servers.
+
+Your project description explicitly says real iterative resolver, which describes how the resolver performs upstream lookups.
+
+### How your resolver works
+
+Suppose a client asks for `google.com`.
+
+1. Client sends a DNS query to your resolver.
+2. Your resolver contacts a root DNS server.
+3. Root server refers it to a `.com` TLD server.
+4. Your resolver contacts the `.com` server.
+5. TLD server refers it to Google's authoritative DNS server.
+6. Your resolver contacts Google's authoritative server.
+7. It obtains the IP address and returns it to the original client.
+
+[Why DNS Is Blazingly Fast (Despite Talking to Half the Internet) | by Codeshbhai | Jan, 2026 | Medium](https://images.openai.com/static-rsc-4/WHqr6o1XfIQNFB33rRA7joWzsNBywm9eVegifH8AId1XWTMtT6WcOg7Thz19sx7aQA-KCMmTTXosuEDafAg83JKBWBBZdA1g_9ENM2Vs0NpXCro9-OqnwPzQpRa4jUs8l-5TsJsm9FlJM_4SFofdpsjtMrccIoaa-vNw7zYAyP4?purpose=inline)
+
+[medium.com](https://medium.com/%40codeshbhai/why-dns-is-blazingly-fast-despite-talking-to-half-the-internet-611718169d25?utm_source=chatgpt.com)
+
+So, technically:
+
+Your application is a recursive resolver from the client's perspective, but it performs iterative queries when communicating with upstream DNS servers.
+
+That's why both descriptions can be correct. Your project statement's terminology, iterative resolver, refers to its upstream resolution strategy.
+
+What is the structure in UDP backend what is the exact lyering like is it parallelised and skippable or sequential, explain with a stick diagram on the side
+
+why is AF_XDP faster
+
+AF_XDP is potentially faster because it reduces the amount of work the Linux kernel has to do for every packet and gives your userspace application more direct control over packet processing.
+
+The biggest difference is not that AF_XDP uses a faster protocol than UDP. It is that it provides a different, more efficient packet-processing path.
+
+Let's compare the two in the context of your DNS resolver.
+
+## 1. UDP vs AF_XDP: What happens to a packet?
+
+### Conventional UDP backend
+
+When a DNS query arrives:
+
+Incoming Ethernet packet
+
+Linux network stack
+
+Ethernet → IP → UDP processing
+
+UDP socket receive buffer
+
+Kernel queues the DNS payload
+
+Userspace: recvfrom()
+
+DNS application receives the payload
+
+DNS resolution logic
+
+The kernel performs substantial work before your application receives the DNS query.
+
+For the response, the reverse networking path is used: your application calls `sendto()`, and the kernel processes and transmits the packet.
+
+### AF_XDP backend
+
+Incoming Ethernet packet
+
+XDP program
+
+Runs early in the kernel's receive path
+
+XSKMAP → AF_XDP socket
+
+Redirects packet to userspace socket
+
+UMEM + RX ring
+
+Userspace accesses packet buffers through descriptors
+
+DNS resolution logic
+
+Application parses packet headers and DNS payload
+
+AF_XDP can redirect packets before they traverse the conventional UDP socket receive path.
+
+This is where the performance opportunity comes from.
+
+## 2. Five reasons AF_XDP can be faster
+
+1\. Bypasses much of the conventional network stack
+
+With ordinary UDP, packets go through the kernel's IP and UDP processing before reaching your socket.
+
+AF_XDP can redirect packets at the XDP layer, avoiding much of that processing for the redirected traffic.
+
+2\. Reduced copying
+
+With conventional UDP, packet data is generally copied from kernel-managed packet buffers into the application's userspace buffer.
+
+AF_XDP uses UMEM, which is shared between the kernel and userspace.
+
+This can reduce data-copying overhead, particularly in zero-copy mode.
+
+3\. Fewer system calls through batching
+
+A conventional implementation might call:
+
+```
+recvfrom();
+process_packet();
+sendto();
+```
+
+for each packet.
+
+AF_XDP uses rings that allow userspace to process multiple packet descriptors in batches.
+
+Fewer system calls and better batching can improve throughput.
+
+4\. Better memory management
+
+AF_XDP gives your application control over packet buffers through four rings:
+
+| Ring       | Responsibility                        |
+| ---------- | ------------------------------------- |
+| Fill       | Supplies buffers for incoming packets |
+| RX         | Delivers received packet descriptors  |
+| TX         | Queues outgoing packet descriptors    |
+| Completion | Returns transmitted buffers for reuse |
+
+This enables efficient buffer reuse and reduces allocation overhead.
+
+5\. Better control over CPU processing
+
+You can use dedicated queues, CPU affinity and multiple AF_XDP sockets to distribute packet processing across CPU cores.
+
+This can improve scalability under high packet loads.
+
+## 3. The biggest difference: Copy mode vs Zero-copy mode
+
+[DPDK - Installation and Optimization - HackMD](https://images.openai.com/static-rsc-4/cvFogRe8ftTX1NduNzPmNfEF0PE7qqRkzGzAKEGg_fxFatC3HA9ZjYC39H5x-zeD__wRpwlnMnmE5IjbgfUxKznlXr7AELKZ0NT3_GArLxdCpe1yqq9pCWqXqfhY9dRlDXzyWExWeWXNg4jhTDPJwbiSuOAOl6BjQuLH68ZSx8I?purpose=inline)
+
+Copy mode
+
+Packet data is copied between kernel and UMEM buffers.
+
+[几句话说清楚22：什么是af_xdp socket | DecodeZ](https://images.openai.com/static-rsc-4/fyf5VxR9ft23wTcyipTPUiLcHNcfzJQWfI8xE7kHKzx0Sc4t9nCReGZLeLKVxDcMxkAYHO6UlHQ9fCQkwZYx8qn3oBQhUAcOj2DyJ2EF5dqunrUk4iBGbFsaLtIJfkE6_aRgehkc917tjC5RnOfO08UchgCRSG4AhG6xFPQlazs?purpose=inline)
+
+Zero-copy mode
+
+NIC can DMA packet data directly into UMEM-backed buffers.
+
+Important distinction:
+
+- AF_XDP copy mode still has packet-copy overhead.
+- AF_XDP zero-copy mode can eliminate an additional packet-data copy.
+- Zero-copy requires compatible NIC driver and hardware support.
+
+Don't assume that simply using AF_XDP means you're running zero-copy.
+
+## 4. Why this matters for your DNS project
+
+Consider 100,000 DNS queries per second.
+
+Your resolver needs to:
+
+- Receive 100,000 packets.
+- Parse 100,000 DNS queries.
+- Perform resolution or cache lookups.
+- Construct 100,000 responses.
+- Transmit 100,000 packets.
+
+Every unnecessary operation becomes significant at this scale.
+
+AF_XDP attempts to reduce the cost of receiving and transmitting those packets.
+
+However, there is an important catch: AF_XDP does not make DNS resolution itself faster.
+
+If your resolver spends most of its time waiting for root, TLD or authoritative DNS servers, optimizing packet reception might have little impact on total query latency.
+
+That's why your stub benchmark is particularly useful: it isolates networking and packet-processing overhead from external DNS lookup delays.
+
+## 5. What you should actually measure
+
+For your project, I'd compare these configurations:
+
+| Metric          | UDP     | AF_XDP copy | AF_XDP zero-copy |
+| --------------- | ------- | ----------- | ---------------- |
+| Queries/sec     | Measure | Measure     | Measure          |
+| p50 latency     | Measure | Measure     | Measure          |
+| p95 latency     | Measure | Measure     | Measure          |
+| p99 latency     | Measure | Measure     | Measure          |
+| CPU utilisation | Measure | Measure     | Measure          |
+| Packet drops    | Measure | Measure     | Measure          |
+
+The experiment I would prioritise
+
+Most useful first experiment
+
+Compare UDP and AF_XDP using the same stub DNS backend, same query workload, same machine and same concurrency levels.
+
+Then compare the real iterative resolver separately.
+
+This will help you answer two different questions:
+
+1. How much faster is AF_XDP at packet processing?
+2. How much does that improvement matter to an actual DNS resolver?
+
+My takeaway: UDP prioritises convenience because Linux handles most networking details. AF_XDP prioritises packet-processing performance by giving userspace more control and reducing overhead. Your project is essentially measuring whether that additional complexity is worth the performance improvement.

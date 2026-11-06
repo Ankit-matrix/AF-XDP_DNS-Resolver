@@ -1,0 +1,1136 @@
+Explain me this workflow with pseudo code in detail and step by step
+
+Let's understand this from the ground up. The diagram shows a high-performance DNS packet-processing workflow using eBPF, XDP, shared memory, and AF_XDP sockets.
+
+The core idea is to process incoming DNS packets as early as possible in the Linux networking stack, then pass selected packets to a userspace DNS resolver while avoiding unnecessary copying of packet data.
+
+I'll walk through the complete packet journey, explain what each component does, and then build pseudocode for both the kernel and userspace sides.
+
+# 1. The big picture
+
+svg
+
+1\. Physical NIC
+
+Receives an Ethernet frame containing a DNS query
+
+svg
+
+2\. NIC driver + native XDP hook
+
+Runs an eBPF program early in packet reception
+
+svg
+
+3\. eBPF packet decision
+
+Inspect headers and choose PASS, DROP, TX, or REDIRECT
+
+svg
+
+4\. AF_XDP socket + UMEM
+
+Selected packets are delivered to userspace through shared packet buffers and rings
+
+svg
+
+5\. DNS resolver application
+
+Parses the query, resolves the name, and prepares a response
+
+Think of this as a fast sorting and delivery pipeline:
+
+- XDP/eBPF: decides what should happen to each packet.
+- AF_XDP: provides a high-speed path for packets between the NIC and a userspace program.
+- UMEM: holds the packet buffers.
+- DNS resolver: performs the actual DNS application logic.
+
+One important distinction: XDP doesn't itself resolve DNS names. It processes packets and makes early decisions.
+
+# 2. Step 1 — The physical NIC receives a DNS query
+
+Suppose a client wants to resolve:
+```
+www.example.com
+```
+
+It sends a DNS query, commonly using UDP port 53.
+
+The packet contains several layers:
+```typescript
+Ethernet frame
+└── IP header
+    └── UDP header
+        └── DNS message
+            ├── Transaction ID
+            ├── Flags
+            ├── Question count
+            └── Question: www.example.com, type A
+```
+
+For example, the UDP header may contain:
+```yaml
+Source port:      51000
+Destination port: 53
+```
+
+The physical NIC receives the Ethernet frame and typically DMA-transfers the packet data into memory associated with a receive queue.
+
+DMA means Direct Memory Access: the NIC can place packet data in memory without the CPU manually copying every byte.
+
+The NIC then notifies the driver that a packet is available, often through interrupts or polling mechanisms such as NAPI.
+
+Conceptually:
+```javascript
+function NIC_receive():
+    frame = receive_ethernet_frame()
+
+    dma_write(frame, receive_buffer)
+
+    notify_driver_that_packet_is_available()
+```
+
+This is conceptual pseudocode. Real NICs use hardware descriptors, receive queues, DMA mappings, and driver-specific mechanisms.
+
+## What happens next?
+
+With ordinary packet reception, the Linux networking stack would continue processing the packet through its normal receive path.
+
+With native XDP, the driver invokes an attached eBPF program early in the receive path, before the packet is processed by most of the usual networking stack.
+
+That brings us to the next stage.
+
+# 3. Step 2 — The NIC driver invokes the native XDP hook
+
+XDP stands for eXpress Data Path.
+
+It lets Linux run a small eBPF program on an incoming packet at a very early stage of the receive path.
+
+The diagram says:
+```less
+[ NIC Driver: Native XDP Hook ]
+              |
+              v
+[ eBPF Program Evaluates Packet ]
+```
+
+The word native matters. Native XDP runs in the driver's receive path, rather than using generic XDP processing on an already constructed socket buffer (`skb`). This generally avoids some of the overhead of the ordinary networking stack.
+
+Imagine this function:
+```cpp
+int xdp_dns_program(struct xdp_md *ctx)
+{
+    // Inspect the received packet.
+    // Decide how Linux should handle it.
+
+    return XDP_PASS;
+}
+```
+
+Here, `ctx` is the XDP context. It provides access to packet boundaries and metadata, including the packet's data pointers.
+
+The program doesn't simply receive a high-level DNS object. It sees packet bytes and must parse the Ethernet, IP, and UDP headers itself.
+
+## How does the program inspect the packet?
+
+Conceptually:
+```javascript
+function inspect_packet(packet):
+    ethernet = parse_ethernet(packet)
+
+    if ethernet is invalid:
+        return DROP
+
+    if ethernet.type != IPv4:
+        return PASS
+
+    ip = parse_ipv4(packet after ethernet)
+
+    if ip is invalid:
+        return DROP
+
+    if ip.protocol != UDP:
+        return PASS
+
+    udp = parse_udp(packet after ip)
+
+    if udp is invalid:
+        return DROP
+
+    if udp.destination_port != 53:
+        return PASS
+
+    return REDIRECT
+```
+
+There are two important implementation details:
+
+1. Every header access must be bounds-checked. A malformed or truncated packet must not cause the program to read beyond the packet's end.
+2. IPv4 header length can vary because of IP options. Real code must use the header's actual length, rather than blindly assuming that every IP header is 20 bytes.
+
+For a production DNS fast path, you would also decide how to handle IPv6, VLAN tags, IP fragments, TCP-based DNS, and malformed packets.
+
+
+
+What does XDP_PASS and XDP_DROP do
+
+Not quite. The packet does not travel through both paths simultaneously. XDP is actually positioned before the normal Linux networking stack.
+
+Think of it as a checkpoint that decides which path the packet takes.
+
+## 1. Actual packet flow
+
+Physical NIC receives packet
+
+NIC Driver invokes XDP / eBPF
+
+Packet inspection and decision
+
+Decision
+
+PASS
+
+Normal Linux stack
+
+IP → UDP → Socket
+
+DROP
+
+Discarded
+
+REDIRECT
+
+AF_XDP
+
+UMEM → RX ring → Userspace
+
+## 2. What happens without XDP?
+
+Without an attached XDP program, the packet follows the conventional networking path:
+
+```
+NIC
+ |
+ v
+NIC Driver
+ |
+ v
+Linux Networking Stack
+ |
+ v
+IP Layer
+ |
+ v
+UDP Layer
+ |
+ v
+UDP Socket
+ |
+ v
+Application
+```
+
+## 3. What happens with XDP?
+
+With native XDP attached:
+
+```
+NIC
+ |
+ v
+NIC Driver
+ |
+ v
+XDP / eBPF       <-- First decision point
+ |
+ +---- XDP_PASS ------> Normal Linux stack
+ |
+ +---- XDP_DROP ------> Discard
+ |
+ +---- XDP_REDIRECT --> AF_XDP socket
+                         |
+                         v
+                       UMEM
+                         |
+                         v
+                       RX Ring
+                         |
+                         v
+                   DNS Resolver
+```
+
+## 4. Why is this important for your project?
+
+Your conventional UDP DNS resolver and AF_XDP DNS resolver have different packet-processing paths.
+
+- UDP backend: Packets enter the normal Linux networking stack and are delivered to your UDP socket.
+- AF_XDP backend: XDP intercepts selected packets early and redirects them to userspace through AF_XDP, bypassing the normal UDP socket-delivery path.
+
+One subtle distinction: the AF_XDP path still uses the NIC driver and XDP infrastructure. It doesn't bypass the NIC or all kernel processing. It bypasses much of the conventional networking stack.
+
+Remember this one sentence: XDP is not a parallel route alongside UDP; it is an early decision point that determines whether a packet enters the normal UDP networking path or takes an alternative route to AF_XDP.
+
+XSKMAP:
+    key 0  -> AF_XDP socket for RX queue 0
+    key 1  -> AF_XDP socket for RX queue 1
+    key 2  -> AF_XDP socket for RX queue 2
+
+RX queues are pre-decided by the NIC right?
+
+In AF_XDP, Copy mode and Zero-copy mode describe how packet data moves between the NIC's memory and userspace UMEM.
+
+The key difference is whether the packet data itself gets copied into UMEM or whether the NIC can directly DMA the packet into a UMEM buffer.
+
+Let's understand this from the ground up.
+
+## 1. First, understand UMEM
+
+UMEM (User Memory) is a region of memory allocated by your userspace application and registered with the AF_XDP subsystem.
+
+Your DNS resolver uses this memory to store incoming and outgoing packet data.
+
+For example:
+
+```
+Userspace DNS Resolver
+        |
+        v
+   UMEM Memory
+   +----------+
+   | Buffer 0 |
+   | Buffer 1 |
+   | Buffer 2 |
+   | Buffer 3 |
+   +----------+
+```
+
+AF_XDP uses four rings to manage packet buffers:
+
+| Ring       | Purpose                                                       |
+| ---------- | ------------------------------------------------------------- |
+| FILL       | Userspace gives empty buffers to the kernel for RX            |
+| RX         | Kernel tells userspace which buffers contain received packets |
+| TX         | Userspace submits packets to transmit                         |
+| COMPLETION | Kernel tells userspace which TX buffers are reusable          |
+
+These rings primarily exchange buffer descriptors and addresses, not entire packet contents.
+
+## 2. Copy mode
+
+In Copy mode, the NIC initially receives the packet into a buffer managed by the driver.
+
+The kernel then copies the packet data into a UMEM buffer.
+
+NIC
+
+Receives packet using DMA
+
+DMA
+
+Driver RX buffer
+
+Original packet data
+
+Memory copy
+
+UMEM buffer
+
+Copied packet data
+
+Userspace DNS resolver
+
+### Pseudocode
+
+```
+// NIC receives packet
+driver_buffer = nic_receive_packet();
+
+// Kernel copies packet into UMEM
+memcpy(umem_buffer, driver_buffer, packet_length);
+
+// Publish the UMEM buffer through RX ring
+rx_ring_push(umem_buffer);
+
+// Userspace reads packet
+packet = rx_ring_pop();
+
+dns_query = parse_dns(packet);
+
+resolve_dns(dns_query);
+```
+
+Notice that `memcpy()` represents the important extra data-copy operation.
+
+The kernel has to copy packet bytes from the driver's receive buffer into UMEM.
+
+Disadvantage: Additional memory-copy overhead, especially when processing large numbers of packets.
+
+## 3. Zero-copy mode
+
+In Zero-copy mode, the NIC can DMA packet data directly into buffers belonging to UMEM.
+
+There is no intermediate copy of the packet data from a separate driver RX buffer into UMEM.
+
+NIC
+
+Receives packet
+
+Direct DMA
+
+UMEM buffer
+
+NIC writes packet data directly here
+
+Userspace DNS resolver
+
+### Pseudocode
+
+```
+// Userspace provides an empty UMEM buffer
+fill_ring_push(umem_buffer);
+
+// NIC receives packet and DMA-writes directly into UMEM
+nic_dma_receive(umem_buffer);
+
+// Kernel publishes descriptor in RX ring
+rx_ring_push(umem_buffer);
+
+// Userspace reads the packet directly
+packet = rx_ring_pop();
+
+dns_query = parse_dns(packet);
+
+resolve_dns(dns_query);
+```
+
+There is no intermediate `memcpy()` of the packet payload.
+
+The NIC writes directly into the memory that your application will eventually access.
+
+Advantage: Less memory-copy overhead and potentially higher packet-processing throughput.
+
+## 4. Side-by-side comparison
+
+| Feature                  | Copy mode             | Zero-copy mode              |
+| ------------------------ | --------------------- | --------------------------- |
+| NIC DMA destination      | Driver RX buffer      | UMEM buffer                 |
+| Intermediate packet copy | Yes                   | No                          |
+| Memory-copy overhead     | Higher                | Lower                       |
+| Hardware support         | More widely supported | Requires driver/NIC support |
+| Implementation           | Easier to support     | More restrictive            |
+| Potential throughput     | Lower                 | Higher                      |
+
+## 5. Does Zero-copy mean absolutely no copying?
+
+No. This is an important distinction.
+
+Zero-copy in AF_XDP means avoiding the intermediate packet-data copy between the driver's RX buffer and UMEM.
+
+It does NOT mean:
+
+- No CPU involvement.
+- No descriptor movement.
+- No packet parsing.
+- No memory access.
+- No copying when your application explicitly copies data.
+
+The CPU still executes your DNS resolver logic. The RX and TX rings still exchange descriptors.
+
+## 6. What about TX (sending DNS responses)?
+
+The same principle applies in the opposite direction.
+
+Copy mode:
+
+```
+DNS Resolver
+     |
+     v
+UMEM buffer
+     |
+     v
+Kernel copies packet into driver TX buffer
+     |
+     v
+NIC transmits packet
+```
+
+Zero-copy mode:
+
+```
+DNS Resolver
+     |
+     v
+UMEM buffer
+     |
+     v
+NIC DMA reads directly from UMEM
+     |
+     v
+NIC transmits packet
+```
+
+Again, zero-copy eliminates the intermediate packet-data copy.
+
+## 7. What should you use in your DNS resolver project?
+
+Since you're comparing a conventional UDP resolver against an AF_XDP resolver, you should understand one experimental detail:
+
+AF_XDP does not automatically mean Zero-copy.
+
+You can run AF_XDP in either Copy or Zero-copy mode.
+
+For your experiments, I'd recommend:
+
+1. Benchmark conventional UDP resolver.
+2. Benchmark AF_XDP in Copy mode.
+3. Benchmark AF_XDP in Zero-copy mode, if your NIC and driver support it.
+4. Keep the DNS resolution backend, workload, concurrency, and packet sizes identical.
+
+This gives you three meaningful measurements.
+
+Your performance comparison
+
+UDP
+
+Normal Linux networking stack
+
+AF_XDP Copy
+
+Early redirect + packet copy
+
+AF_XDP Zero-copy
+
+Early redirect + direct DMA
+
+One caveat for your environment: your earlier benchmarks used WSL2 and a virtual network interface. Native AF_XDP zero-copy may not be supported there. You should verify the actual socket mode rather than assuming zero-copy was enabled.
+
+The simplest way to remember it:
+
+- Copy mode: NIC → Driver buffer → Copy → UMEM → Userspace.
+- Zero-copy mode: NIC → DMA directly into UMEM → Userspace.
+
+That's the fundamental difference.
+
+But both of them relies on ctx->rx_queues right
+
+Yes. Both Copy mode and Zero-copy mode use the same RX queue and XDP redirection architecture. The difference is what happens to the packet data after the NIC receives it.
+
+The `ctx->rx_queue_index` (not `ctx->rx_queues`) identifies the RX queue on which the packet arrived.
+
+### 1. What remains the same in both modes?
+
+```
+             Physical NIC
+                  |
+             RSS hashing
+                  |
+          +-------+-------+
+          |       |       |
+         RX0     RX1     RX2
+          |       |       |
+          v       v       v
+         XDP     XDP     XDP
+          |       |       |
+          v       v       v
+        XSKMAP  XSKMAP  XSKMAP
+         key 0   key 1   key 2
+          |       |       |
+         XSK0    XSK1    XSK2
+```
+
+Your eBPF program can use:
+
+```
+ctx->rx_queue_index
+```
+
+to select the corresponding AF_XDP socket from XSKMAP.
+
+This is true for both Copy and Zero-copy modes.
+
+### 2. Where do they differ?
+
+Copy mode
+
+NIC RX Queue
+
+XDP → XSKMAP → AF_XDP socket
+
+Copy packet data
+
+UMEM
+
+Zero-copy mode
+
+NIC RX Queue
+
+XDP → XSKMAP → AF_XDP socket
+
+Direct DMA into UMEM
+
+UMEM
+
+### 3. Important distinction
+
+| Component             | Copy              | Zero-copy    |
+| --------------------- | ----------------- | ------------ |
+| NIC RX queues         | Same              | Same         |
+| RSS                   | Same              | Same         |
+| XDP program           | Same              | Same         |
+| `ctx->rx_queue_index` | Same              | Same         |
+| XSKMAP                | Same              | Same         |
+| AF_XDP sockets        | Same concept      | Same concept |
+| Packet data movement  | Intermediate copy | Direct DMA   |
+
+One additional detail: Zero-copy requires the NIC driver to support it and the AF_XDP socket to successfully bind in zero-copy mode. Otherwise, the application may use Copy mode.
+
+So, think of it this way:
+
+- RX queues determine where the packet enters.
+- XSKMAP determines which AF_XDP socket receives it.
+- Copy/Zero-copy determines how packet data reaches UMEM.
+
+Where is this rx buffer placed, thats the only thing different right
+
+Yes, you're identifying the main difference correctly: the location and ownership of the packet buffer used for receiving are what fundamentally differ.
+
+But there's one small distinction: it's not just where the buffer is placed; it's also who manages it and how the NIC accesses it.
+
+## 1. Copy mode: RX buffer is separate from UMEM
+
+The driver maintains its own RX buffers, typically allocated and managed through the kernel's networking memory mechanisms.
+
+```
+             NIC
+              |
+              | DMA
+              v
+    +---------------------+
+    | Driver RX Buffer    |  <-- Kernel/driver managed
+    | Original packet     |
+    +---------------------+
+              |
+              | memcpy()
+              v
+    +---------------------+
+    | UMEM Buffer         |  <-- Userspace allocated
+    | Copied packet       |
+    +---------------------+
+              |
+              v
+       DNS Resolver
+```
+
+The packet is initially placed in the driver's RX buffer. The kernel then copies it into UMEM.
+
+## 2. Zero-copy mode: UMEM is the RX buffer
+
+In Zero-copy mode, the NIC directly DMA-writes the incoming packet into a UMEM buffer.
+
+```
+             NIC
+              |
+              | DMA
+              v
+    +---------------------+
+    | UMEM Buffer         |  <-- Userspace allocated
+    | Original packet     |
+    +---------------------+
+              |
+              v
+       DNS Resolver
+```
+
+There is no separate intermediate driver RX buffer containing another copy of the packet.
+
+## 3. Side-by-side comparison
+
+| Property                   | Copy mode        | Zero-copy mode              |
+| -------------------------- | ---------------- | --------------------------- |
+| Initial packet destination | Driver RX buffer | UMEM buffer                 |
+| RX buffer ownership        | Driver/kernel    | UMEM managed by application |
+| Extra packet copy          | Yes              | No                          |
+| NIC DMA directly into UMEM | No               | Yes                         |
+
+## 4. One important clarification
+
+UMEM is allocated by userspace, but that doesn't mean userspace can freely use every buffer at all times.
+
+AF_XDP has a buffer ownership lifecycle:
+
+- FILL ring: Userspace gives available UMEM buffers to the kernel for RX.
+- NIC: Writes incoming packet data into an available buffer.
+- RX ring: Kernel publishes the received buffer descriptor to userspace.
+- Userspace: Processes the packet and eventually recycles the buffer.
+
+This ownership discipline prevents the NIC from overwriting a packet while your DNS resolver is processing it.
+
+Remember: Copy mode uses a separate driver RX buffer and copies packet data into UMEM. Zero-copy mode uses UMEM buffers directly as NIC DMA destinations.
+
+so copy mode is : nic , driver , drives rx queue , umem then userspace when required
+
+Yes, that's essentially correct. Just one small refinement: the RX queue is managed by the driver, and the driver RX buffer is where the NIC initially DMA-writes the packet.
+
+### Copy mode packet journey
+
+```
+        Physical NIC
+             |
+             | DMA
+             v
+     Driver RX Buffer
+             |
+             | XDP executes
+             | XDP_REDIRECT
+             v
+       XSKMAP lookup
+             |
+             v
+       AF_XDP Socket
+             |
+             | Copy packet data
+             v
+           UMEM
+             |
+             | RX ring descriptor
+             v
+          Userspace
+             |
+             v
+       DNS Resolver
+```
+
+### Zero-copy mode
+
+```
+        Physical NIC
+             |
+             | Direct DMA
+             v
+           UMEM
+             |
+             | RX ring descriptor
+             v
+          Userspace
+             |
+             v
+       DNS Resolver
+```
+
+One technical detail: in Copy mode, XDP executes on the driver's received packet before the AF_XDP copy takes place. The redirect selects the AF_XDP socket, and the AF_XDP path copies the packet into its UMEM buffer.
+
+The fundamental difference:
+
+- Copy: NIC → Driver RX buffer → UMEM.
+- Zero-copy: NIC → UMEM directly.
+
+The RX queue, XDP program, XSKMAP and userspace resolver architecture remain conceptually the same.
+
+where did we do the dropping, passing redirect and is the data parsed in the umem
+
+Good question. You're now connecting the different stages of the AF_XDP architecture.
+
+There are two separate things happening:
+
+1. XDP/eBPF decides what to do with the incoming packet (PASS, DROP, REDIRECT).
+2. Userspace parses the packet data stored in UMEM (Ethernet, IP, UDP, DNS headers).
+
+Let's trace the complete Zero-copy workflow.
+
+## 1. Where do PASS, DROP and REDIRECT happen?
+
+They happen inside the eBPF/XDP program, which executes in the NIC driver's receive path.
+
+Importantly, this happens before userspace gets access to the packet through the AF_XDP RX ring.
+
+```
+             Physical NIC
+                  |
+                  | DMA into UMEM buffer
+                  v
+             NIC Driver
+                  |
+                  v
+             XDP / eBPF
+                  |
+          +-------+-------+
+          |       |       |
+          v       v       v
+        PASS     DROP   REDIRECT
+          |       |       |
+          v       v       v
+       Normal   Discard  XSKMAP
+       Linux              |
+       Stack              v
+                       AF_XDP
+                       Socket
+                          |
+                          v
+                       RX Ring
+                          |
+                          v
+                       Userspace
+```
+
+What each decision means:
+
+| Action         | What happens                                            |
+| -------------- | ------------------------------------------------------- |
+| `XDP_PASS`     | Packet continues into normal Linux networking           |
+| `XDP_DROP`     | Packet is discarded                                     |
+| `XDP_REDIRECT` | Packet is redirected to an AF_XDP socket through XSKMAP |
+
+One subtlety: in Zero-copy mode, the NIC can DMA directly into UMEM before the XDP program makes its decision. Therefore, even a packet that gets dropped may already have been DMA-written into a UMEM buffer. That buffer is then reclaimed by the AF_XDP/kernel buffer-management machinery.
+
+## 2. Is the data parsed inside UMEM?
+
+No. UMEM is just memory. It does not parse anything.
+
+It stores raw packet bytes.
+
+For example, suppose the NIC receives a DNS query for `www.example.com`.
+
+The UMEM buffer contains something conceptually like:
+
+```
+UMEM BUFFER
++--------------------------------+
+| Ethernet Header                |
++--------------------------------+
+| IPv4 Header                    |
++--------------------------------+
+| UDP Header                     |
++--------------------------------+
+| DNS Header                     |
++--------------------------------+
+| DNS Question                   |
+| www.example.com                |
++--------------------------------+
+```
+
+The packet is stored as bytes, not as a pre-parsed DNS object.
+
+Your userspace application reads the buffer descriptor from the RX ring and parses those bytes.
+
+## 3. Where does actual parsing happen?
+
+Inside your userspace DNS resolver.
+
+For example:
+
+```
+// 1. Receive packet descriptor
+struct xdp_desc desc;
+
+rx_ring_consume(&desc);
+
+// 2. Find packet inside UMEM
+void *packet = umem + desc.addr;
+
+// 3. Parse Ethernet header
+struct ethhdr *eth = packet;
+
+// 4. Parse IPv4 header
+struct iphdr *ip = packet + sizeof(*eth);
+
+// 5. Parse UDP header
+struct udphdr *udp =
+    (void *)ip + ip->ihl * 4;
+
+// 6. Parse DNS message
+struct dns_header *dns =
+    (void *)udp + sizeof(*udp);
+
+// 7. Extract DNS question
+parse_dns_question(dns);
+```
+
+This is simplified pseudocode; real code must validate packet boundaries, VLAN tags, IP options, fragmentation and header lengths before accessing each field.
+
+## 4. So what exactly does eBPF parse?
+
+Your eBPF program also parses some packet headers, but for a different purpose.
+
+| Component          | What it parses                                  | Why?                                       |
+| ------------------ | ----------------------------------------------- | ------------------------------------------ |
+| XDP/eBPF           | Ethernet, IP, UDP headers                       | Decide PASS, DROP or REDIRECT              |
+| Userspace resolver | Ethernet, IP, UDP, DNS headers and DNS question | Actually process and resolve the DNS query |
+
+For example:
+
+eBPF:
+
+```
+if (udp->dest == 53)
+    return bpf_redirect_map(&xsks_map, queue_id, 0);
+
+return XDP_PASS;
+```
+
+Userspace:
+
+```
+query = parse_dns_question(packet);
+
+answer = resolve_dns(query);
+
+response = construct_dns_response(answer);
+
+send_response(response);
+```
+
+## 5. The complete mental model
+
+NIC
+
+Receives packet; DMA into UMEM in Zero-copy mode
+
+XDP / eBPF
+
+Early packet inspection and decision
+
+REDIRECT
+
+AF_XDP RX Ring
+
+Publishes a descriptor pointing to packet data in UMEM
+
+Userspace DNS Resolver
+
+Parses DNS query → resolves domain → constructs response
+
+The key distinction to remember:
+
+- XDP parses enough headers to decide where a packet should go.
+- UMEM stores the raw packet bytes.
+- The userspace resolver parses those bytes to understand the DNS query and generate an answer.
+
+Think of XDP as the security guard checking tickets at the entrance, while your DNS resolver is the actual person handling the request.
+
+in copy mode , the af_xdp socket writes into umem , so that is the final parsed thing right?
+
+Not quite. The important distinction is that UMEM contains the copied raw packet, not the parsed packet.
+
+Let's separate the operations.
+
+### Copy mode
+
+```
+NIC
+ |
+ | DMA
+ v
+Driver RX Buffer
+ |
+ | XDP executes
+ | XDP_REDIRECT
+ v
+XSKMAP → AF_XDP Socket
+ |
+ | Kernel copies packet bytes
+ v
+UMEM Buffer
+ |
+ | RX ring publishes descriptor
+ v
+Userspace DNS Resolver
+ |
+ | Parses raw packet bytes
+ v
+Parsed DNS Query
+ |
+ | Resolves domain
+ v
+DNS Response
+```
+
+### What exactly is inside UMEM?
+
+Suppose the incoming DNS query is for `www.example.com`.
+
+After the AF_XDP copy operation, UMEM contains:
+
+```
+UMEM BUFFER
++-------------------------+
+| Ethernet Header         |
++-------------------------+
+| IPv4 Header             |
++-------------------------+
+| UDP Header              |
++-------------------------+
+| DNS Header              |
++-------------------------+
+| DNS Question            |
+| www.example.com         |
++-------------------------+
+```
+
+These are still raw packet bytes.
+
+### Who does what?
+
+| Component          | Responsibility                        |
+| ------------------ | ------------------------------------- |
+| NIC                | Receives packet                       |
+| Driver             | Manages RX queue and RX buffers       |
+| XDP/eBPF           | Inspects headers and redirects packet |
+| AF_XDP kernel path | Copies packet into UMEM in Copy mode  |
+| RX ring            | Publishes buffer descriptor           |
+| Userspace          | Parses DNS message and resolves query |
+
+### Remember this distinction
+
+There are two different meanings of copying and parsing:
+
+- Copying: Moving packet bytes from the driver RX buffer into UMEM.
+- Parsing: Interpreting those bytes as Ethernet, IP, UDP and DNS structures.
+
+Copying does not automatically mean parsing.
+
+Your userspace DNS resolver performs the actual DNS parsing after retrieving the packet from UMEM.
+
+What if there is a XDP pass or drop after the buffer in umem has been dma'd upon
+
+This is an important question because it exposes something subtle about Zero-copy AF_XDP.
+
+Yes, the NIC may have already DMA-written the packet into a UMEM buffer before the XDP program decides whether to PASS, DROP or REDIRECT it.
+
+Let's see what happens to that buffer in each case.
+
+## 1. First, understand the sequence
+
+In native Zero-copy mode, the conceptual receive sequence is:
+
+```
+1. Userspace supplies empty UMEM buffers
+              |
+              v
+2. Buffers are made available through FILL ring
+              |
+              v
+3. NIC receives packet
+              |
+              v
+4. NIC DMA-writes packet into UMEM buffer
+              |
+              v
+5. XDP/eBPF executes
+              |
+              v
+6. XDP decides PASS / DROP / REDIRECT
+```
+
+Now let's examine the three outcomes.
+
+## 2. Case A: XDP_REDIRECT
+
+Packet accepted by AF_XDP
+
+```
+NIC
+ |
+ v
+UMEM buffer (packet DMA-written)
+ |
+ v
+XDP
+ |
+ v
+XDP_REDIRECT
+ |
+ v
+XSKMAP
+ |
+ v
+AF_XDP RX ring
+ |
+ v
+Userspace DNS resolver
+```
+
+The RX ring receives a descriptor pointing to the same UMEM buffer.
+
+No additional packet-data copy is needed.
+
+## 3. Case B: XDP_DROP
+
+Packet discarded
+
+```
+NIC
+ |
+ v
+UMEM buffer (packet DMA-written)
+ |
+ v
+XDP
+ |
+ v
+XDP_DROP
+ |
+ v
+Packet discarded
+ |
+ v
+UMEM buffer reclaimed for reuse
+```
+
+What happens?
+
+- The packet is discarded.
+- Userspace does not receive an RX descriptor for it.
+- The buffer is returned to the kernel/driver's available-buffer management.
+- It can subsequently be reused for another incoming packet.
+
+The important point: the buffer is not permanently wasted just because the packet was dropped.
+
+## 4. Case C: XDP_PASS
+
+Packet enters normal Linux networking
+
+```
+NIC
+ |
+ v
+UMEM buffer (packet DMA-written)
+ |
+ v
+XDP
+ |
+ v
+XDP_PASS
+ |
+ v
+Normal Linux networking stack
+ |
+ v
+IP → UDP → Socket
+```
+
+In Zero-copy mode, this is more complicated than DROP or REDIRECT.
+
+The packet has been received into an XSK/UMEM-backed buffer, but the normal networking stack needs a packet representation it can process.
+
+The driver/kernel handles the necessary transition. Depending on the driver and implementation, this can involve constructing an skb around the received data or other buffer-management operations.
+
+The AF_XDP application does not receive that packet through its RX ring.
+
+## 5. Comparison
+
+| XDP action | Userspace AF_XDP receives packet? | What happens to UMEM buffer?                                     |
+| ---------- | --------------------------------- | ---------------------------------------------------------------- |
+| REDIRECT   | Yes                               | RX descriptor published; userspace eventually recycles it        |
+| DROP       | No                                | Reclaimed for reuse                                              |
+| PASS       | No                                | Used by normal networking path; eventually reclaimed or recycled |
+
+## 6. One important takeaway for your project
+
+Think of the buffer as a temporary container.
+
+The NIC fills it with packet data. XDP decides where the packet goes. The buffer then follows the ownership and recycling rules of that destination.
+
+DMA into UMEM does not mean the packet must reach your DNS resolver.
+
+Only `XDP_REDIRECT` to the appropriate AF_XDP socket makes it available through that socket's RX ring.

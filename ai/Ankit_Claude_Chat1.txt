@@ -1,0 +1,235 @@
+So this is how it started
+the attached image represents the original problem statement for our project
+Now, we spent some time discussing and 2 of our teammates started working on this, here is the chat reference:
+Me and Adil are planning this workflow:
+1. We'll start UDP resolver. 
+2. Benchmark it
+3. Then over to someone will be spending that time looking at XDP socket
+4. XDP team will replace UDP socket with XDP socket and benchmark
+
+I am also sharing the ChatGPT history that me and another of my teammate used in understanding the project architecture
+Explain me this workflow with pseudo code in detail and step by step
+
+I have pasted the ChatGPT response
+
+Also attached are a few doubts that I asked ChatGPT, through all this, you can infer my understanding of this project, my instructor asked us to build it from a top down appraoch, understanding and breakdown each concept till we reach the bare code level at which we have basically built the entire project working and running, after which we can move forward with benchmarking as specified by the problem statement
+
+Tell me how should I move forward from here
+
+Also I have given you access to the directory where me teammates built the "UDP-DNS baseline" I have't gone through that yet
+
+I'll look at your teammates' UDP baseline first, then lay out a path forward that fits the top-down approach.
+
+I read your teammates' baseline (`udp_dns_resolver.c`, the README, and the test scripts). Your ChatGPT notes show you have the AF_XDP model right: four rings per socket+UMEM, the FILL ring carries empty frame addresses, the RX ring carries only redirected packets, and one XDP program serves every queue. So the next step isn't more theory. It's connecting that model to this code and settling a few design decisions before the "swap" step in your workflow starts.
+
+## What your teammates built
+
+It's a **DNS forwarder**, not a full resolver. It listens on UDP port **5353**, sends A/AAAA queries on to 8.8.8.8, and answers anything else with NOTIMP straight away. It uses one `epoll` loop with two sockets:
+
+```
+client_fd  (bound :5353)  ── Path A: query in → validate → swap TXID → send to 8.8.8.8
+upstream_fd (ephemeral)   ── Path B: reply in → check source is 8.8.8.8:53 → restore TXID → send to client
+state_table[65536]        ── upstream TXID → (original TXID, client addr)
+```
+
+This lines up with the resolver pseudocode you already have. `recvfrom()` plays the part of `consume_RX_ring()`, `sendto()` plays the part of `submit_to_TX_ring()`, and the kernel quietly does everything in between.
+
+## Four problems to deal with before the AF_XDP work
+
+**1. The benchmark measures Google, not your code.** The README says this itself: latency is "dominated by the round trip to 8.8.8.8." With an average of about 17 ms per query, the socket overhead you want to remove (a few microseconds) can't be seen. If you swap in AF_XDP now, the numbers will look the same. You need a **local-answer mode** (a hardcoded or cached answer, with no upstream call) in **both** versions. The problem statement's "latency, throughput, CPU overhead" comparison only means something in that mode. Keep upstream forwarding as a separate, functional-only mode.
+
+**2. "Replace the UDP socket with an XDP socket" isn't really a swap.** An AF_XDP socket gives you raw Ethernet frames. Everything `sendto()` did for you becomes your job:
+- Ethernet header: MAC addresses. In practice you swap the source and destination MACs from the query.
+- IPv4 header: swap the addresses, set the TTL, and **recompute the IP checksum**.
+- UDP: swap the ports, fix the length, and handle the checksum (it's optional for IPv4, so set it to 0 at first).
+- Upstream traffic: the replies from 8.8.8.8 also arrive at the NIC. Either the XDP program redirects them too (`src port 53`), or you keep the upstream on an ordinary socket (a hybrid design).
+
+The simplest honest design is local-answer mode with responses sent back through the TX ring. That's exactly what the problem statement describes.
+
+**3. Environment.** The README says everything runs in **WSL** against `127.0.0.1`. For the AF_XDP phase that's a problem:
+- The WSL2 kernel may not have `CONFIG_XDP_SOCKETS` / BPF enabled. Check this first.
+- Loopback only supports generic (skb) XDP, so you'd be benchmarking AF_XDP's slowest mode.
+
+The usual setup is a **veth pair plus a network namespace**: `dnsperf` runs inside `ns_client`, and the resolver attaches to `veth0`. Run it on a native Linux machine or VM if you can. Settle this now, because it decides whether phase 3 works at all.
+
+**4. Bugs in the baseline** (worth fixing before you trust any numbers):
+- Path B has `if((size_t)bytes_read < 0)`, which can never be true. On EAGAIN, -1 becomes a huge number, slips past the header-length check, and the loop processes **stale buffer contents**. It should be `if (bytes_read < 0)`.
+- The `dns_header` bitfields only work on little-endian machines and are compiler-dependent. Reading `buffer[2]` and `buffer[3]` with masks is safer, and the AF_XDP parser needs that approach anyway.
+- The README's build commands compile `resolver.c`, but the file is `udp_dns_resolver.c`.
+- The README already lists the other known issues: state slots leak (no timeout), `BUF_SIZE` 512 is too small, TXIDs are sequential, and the anti-spoof test was never re-run properly.
+
+## A top-down path from here
+
+Each level ends with something you can run, so your instructor's top-down approach stays visible.
+
+**Level 0: Both versions follow one contract.**
+```
+loop:
+    pkt = receive()                 # recvfrom  |  RX ring + UMEM
+    q   = parse_dns(pkt)            # shared code
+    if invalid: drop
+    resp = build_answer(q)          # local mode (benchmark) | forward (functional)
+    send(resp)                      # sendto    |  build eth/ip/udp → TX ring
+```
+Pull `parse_dns()` and `build_answer()` out of `main()` into a shared file (e.g. `dns.c`). Both versions call the same functions, so the only difference between them is packet I/O. That's what makes the comparison fair.
+
+**Level 1: Baseline v2 (UDP).** Fix the bugs, add `--local` mode, and record `dnsperf` numbers plus CPU usage (`perf stat` or `mpstat`) in the veth/namespace setup.
+
+**Level 2: XDP alone (no AF_XDP yet).** Write `xdp_dns.c`. It parses Ethernet, IPv4 and UDP with bounds checks, and for `dst port 5353` it just increments a counter in a BPF map and returns `XDP_PASS`. Load it with `xdp-loader` and read the counter with `bpftool map dump`. This proves the kernel side works on its own.
+
+**Level 3: AF_XDP receive only.** Change `XDP_PASS` to `bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS)`. In userspace, set up UMEM, fill the FILL ring, and loop on the RX ring, printing the QNAME of each query with the shared parser. This is your four-query, three-frame walkthrough turned into code: watch frames go FILL → RX → back to FILL.
+
+**Level 4: AF_XDP TX.** Turn the query frame into the response in place: swap the MACs, IPs and ports, write the answer, fix the lengths and IP checksum, put the frame on the TX ring, `sendto(xsk_fd, NULL, 0, MSG_DONTWAIT, ...)` to kick it, then reclaim from the COMPLETION ring and refill the FILL ring. Check it in Wireshark, then with `dig`.
+
+**Level 5: Benchmark.** Use the same `dnsperf` command, payload and local mode against both versions, and collect QPS, latency percentiles and CPU per query. Note copy mode vs zero-copy mode in the results. veth will probably give you copy mode, and saying so honestly is part of the "tradeoffs" deliverable.
+
+Here's a rough skeleton for Levels 3–4, mapped onto the structure of the current code:
+
+```c
+// setup (replaces socket()/bind()/epoll)
+umem = xsk_umem__create(buf, NUM_FRAMES*FRAME_SIZE, &fill, &comp, ...);
+xsk  = xsk_socket__create(&xsk, "veth0", 0 /*queue*/, umem, &rx, &tx, &cfg);
+bpf_map_update_elem(xsks_map_fd, &(int){0}, &xsk_fd, 0);
+refill_fill_ring(NUM_FRAMES);
+
+// loop (replaces epoll_wait + Path A)
+for (;;) {
+    reclaim_completions();                          // COMPLETION → free list
+    n = xsk_ring_cons__peek(&rx, BATCH, &idx);      // RX ring
+    for (i = 0; i < n; i++) {
+        desc = xsk_ring_cons__rx_desc(&rx, idx+i);
+        pkt  = xsk_umem__get_data(buf, desc->addr);
+        if (!parse_eth_ip_udp(pkt, desc->len, &dns, &dns_len) ||
+            !parse_dns(dns, dns_len, &q))  { free_frame(desc->addr); continue; }
+        len = build_answer_inplace(pkt, &q);        // swap headers, checksum
+        tx_submit(desc->addr, len);                 // same frame goes out on TX
+    }
+    xsk_ring_cons__release(&rx, n);
+    kick_tx();  refill_fill_ring_from_free_list();
+}
+```
+
+## What I'd do this week
+
+1. **You**: read `udp_dns_resolver.c` alongside the Level 0 contract above, so you can map every line to "receive / parse / answer / send." That's your bridge into the code.
+2. **Team decision**: agree on local-answer mode and the veth/native-Linux environment. Both affect everyone's work.
+3. **Split the work**: Adil and the other baseline teammate fix the bugs, pull out `dns.c`, and add local mode. You and the XDP side start Level 2, which doesn't depend on any of their changes.
+
+I can write the Level 2 XDP program, plus the veth/namespace setup script, as your next concrete step.
+
+It is recursive resolver right?
+
+No, it's a **forwarder**, not a recursive resolver. The README calls it a "UDP DNS Forwarder," and the code shows why:
+
+- It doesn't walk the DNS hierarchy (root → TLD → authoritative). It sends every A/AAAA query to one upstream server, `8.8.8.8:53`, and relays the answer.
+- Google's server does the recursion. The teammates' program only relays packets, rewrites transaction IDs, and sends replies back to the original client.
+- It has no cache and no iterative lookups. Each query goes upstream, and the state table only remembers which client asked for each transaction ID.
+
+The difference matters for your project. A recursive resolver would need to:
+1. Query root servers for the TLD name servers (`.com`), then query those for the domain's authoritative servers, then get the answer.
+2. Handle referrals, glue records, CNAME chains, and timeouts at each step.
+3. Usually cache answers according to their TTLs.
+
+The problem statement you shared says "DNS resolver," which is broad enough to cover either. Before the AF_XDP work, confirm with your instructor whether "resolver" means a forwarder (like the baseline) or a full recursive resolver. If it's a recursive one, the baseline needs a substantial rework, and that changes the plan I described earlier. The packet I/O side (XDP and AF_XDP) stays the same either way. Only the `build_answer()` part from the shared contract would change.
+
+Can this piece of code be turned into a recursive resolver?
+
+Yes, it can, but it's a substantial change. The current code gets the packet plumbing right (bounded parsing, TXID state, epoll loop). The part that has to change is what happens between "query in" and "answer out."
+
+## What changes
+
+**1. Query handling (Path A).** Instead of forwarding to 8.8.8.8, the resolver starts at a root server and follows referrals. Each query becomes a small state machine:
+
+```
+resolve(name, qtype, client):
+    server = ROOT_SERVER                       # e.g. a.root-servers.net
+    loop up to MAX_DEPTH (say 16):
+        reply = query(server, name, qtype)     # one UDP round trip
+        if reply.has_answer:                   # NOERROR + answer section
+            return reply.answers
+        if reply.is_nxdomain:
+            return NXDOMAIN
+        if reply.has_cname:
+            name = reply.cname_target          # restart with the target
+            server = ROOT_SERVER
+            continue
+        if reply.has_referral:                 # NS records in authority section
+            server = pick_glue_address(reply)  # A record in additional section
+            if none: server = resolve(ns_name, A).first   # glueless: recurse
+            continue
+    return SERVFAIL
+```
+
+**2. State table.** The current table maps one upstream TXID to one client. A recursive resolver has many outstanding queries per client request, one per hop, and some hops spawn sub-queries (glueless NS lookups). So each in-flight query needs its own record:
+
+```c
+struct pending {
+    uint8_t  active;
+    uint16_t txid;              // our outgoing transaction ID
+    uint16_t client_txid;       // original client's ID
+    struct sockaddr_in client;  // where to reply
+    char     qname[256];
+    uint16_t qtype;
+    uint8_t  depth;             // hops so far, to stop loops
+    uint32_t deadline_ms;       // for timeouts
+    int      parent;            // index of the waiting parent, or -1
+};
+```
+
+**3. Upstream replies.** Path B can't just rewrite the TXID and forward. It has to parse the full response, check that the question matches what was asked, then decide: answer, follow a referral, or fail.
+
+**4. Timeouts and retries.** Servers don't always reply. Each pending query needs a deadline, a retry on a different server, and cleanup. This also fixes the state-slot leak the README mentions.
+
+**5. Caching.** Not strictly required, but without it every query walks from the root, which is slow and hits root servers hard. A cache keyed by `(name, type)` that honors TTLs is the usual next step.
+
+**6. Response building.** The answer section now has to be assembled from the resolved records (possibly several, with CNAME chains included), not just echoing the upstream reply.
+
+## What stays the same
+
+- The `epoll` loop, bounded parsing, and anti-spoofing ideas carry over, though the source check changes. Replies can now come from many servers, so you validate by TXID, question match, and an unpredictable source port, not by a single fixed IP.
+- The `skip_qname` bounds checks are a good base. You also need DNS **name decompression** (compression pointers, `0xC0` prefixes), which the current code doesn't handle and which replies from real servers use everywhere. Pointer loops must be bounded.
+
+## Things to get right
+
+- **Randomize TXIDs and source ports.** Sequential TXIDs (the baseline's weakness) make cache poisoning easy. A recursive resolver is exactly the target of that attack.
+- **Watch for loops.** Glueless referrals and CNAME chains can cycle, so enforce a depth limit and a total-query budget per client request.
+- **Be a good citizen in tests.** Hitting the real root servers from a class project is slow and can get you rate-limited. Use a local authoritative test setup (for example, a small zone served by `dnsmasq` or `bind` in a namespace) with the root hint pointing at it.
+
+## Effort and order
+
+Roughly, the work breaks into: name parsing and compression (1–2 days), a single-hop query-and-parse path (1–2 days), the iterative state machine with depth limits (2–3 days), then timeouts, caching and the AF_XDP integration (the remaining time). The AF_XDP side doesn't change: the XDP program and rings still deliver query frames and carry replies out. But the recursive logic also needs to send its *own* outgoing queries, which means the AF_XDP path has to handle upstream traffic too. That's the piece I'd settle with your team early, because it decides whether upstream queries use a normal UDP socket (simpler) or AF_XDP (more uniform, harder to debug).
+
+I'd start with a single-hop prototype against a local authoritative server before attempting the full root-to-answer walk.
+
+What do we implement first, AF_XDP forwarding or DNS resolver?
+
+Implement the **DNS resolver logic first**, using ordinary UDP sockets. Add AF_XDP after it works.
+
+**Why the resolver first:**
+
+- **You can check it with `dig`.** A correct answer for a name is an obvious pass/fail. Debugging AF_XDP while the DNS logic is also unproven means you can't tell which layer broke.
+- **AF_XDP is only transport.** It delivers the same query bytes that `recvfrom()` returns and takes the same reply bytes that `sendto()` sends. Your parser and resolver don't change, so building them first means nothing is wasted.
+- **AF_XDP depends on your environment.** It needs kernel support, veth or a native NIC, and root. If that setup isn't ready, you'd be stuck with no working program at all. The UDP version runs anywhere, including the WSL setup the baseline already uses.
+- **It gives you a correct baseline to benchmark against.** The project's comparison needs a working UDP version. Without it there's nothing to measure AF_XDP against.
+
+**Suggested order:**
+
+1. **Shared DNS code** (`dns.c`): name parsing with compression pointers, question and answer parsing, building replies. Test it on captured packets, no sockets needed.
+2. **Single-hop query**: send one query to a local authoritative test server (for example, a small `dnsmasq` or `bind` zone), parse the reply. This is the first thing that can fail in an interesting way.
+3. **Iterative resolution**: referrals, glue, CNAMEs, depth limit, timeouts. Test against the local hierarchy, not the real root.
+4. **Caching and random TXIDs and source ports.**
+5. **AF_XDP receive** (XDP program redirects port 53 to an XSK socket, parser reads frames from the RX ring). Verify that queries arrive and get the same answers as step 3.
+6. **AF_XDP transmit** (build replies in-frame, TX ring, completion handling).
+7. **Benchmark both**, in local-answer mode and with real recursion, as covered earlier.
+
+**One exception:** if your instructor's top-down order is strict, do Level 2 from the earlier plan (the XDP program that just counts packets on port 5353) early. It's small, doesn't depend on the resolver, and proves your environment works. Then go back to the resolver. That keeps the top-down sequence without making AF_XDP the critical path.
+
+First of all, let's run the current code, how do I do that? step by step
+
+You need WSL (Windows Subsystem for Linux) since the code uses Linux-specific APIs (`epoll`, POSIX sockets). Here's the step-by-step:
+
+Two things to watch for:
+- **WSL2 and networking**: the resolver runs on `127.0.0.1:5353` inside WSL, so `dig` must also run from inside WSL (not from Windows Command Prompt or PowerShell).
+- **The build warning**: the README has the wrong filename (`resolver.c` instead of `udp_dns_resolver.c`). Use the corrected command in Step 4.
+
+Let me know what output you get at each step and I can help you debug from there.
