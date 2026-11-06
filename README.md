@@ -164,4 +164,4 @@ Method, raw data and analysis: [`results_/README.md`](results_/README.md).
 - AF_XDP in copy mode only; zero-copy needs a ZC-capable NIC (`i40e`, `ice`, `mlx5`).
 - Single RX queue (queue 0); IPv4 only.
 - Reply MAC addresses are the query's swapped, so clients must share the L2 segment.
-- No EDNS0, TCP fallback or DNSSEC; one upstream socket (16-bit TXID entropy only).
+- No EDNS0 or any TCP fallback 
